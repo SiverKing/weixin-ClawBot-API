@@ -89,6 +89,81 @@ async def send_msg_safe(session, to_id, context_token, text, bot_token_ref, bot_
         print(f"[重连通知] 发送失败({e})，降级打印: {text}")
 
 
+async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
+                       typing_ticket_cache, reconnect_asked, warning_active,
+                       reconnect_in_progress, login_time_ref, cfg):
+    """执行重连流程。防重入，失败时优雅降级，成功后原子替换 token。"""
+    if reconnect_in_progress[0]:
+        return
+    reconnect_in_progress[0] = True
+    warning_active[0] = False
+    reconnect_asked.clear()
+
+    print("[重连] 开始重连流程...")
+    from_id = last_contact["from_id"]
+    ctx = last_contact["context_token"]
+
+    # 获取新二维码（必须带 bot_type=3，使用动态 base_url）
+    _base = bot_base_url_ref[0] or BASE_URL
+    try:
+        async with session.get(
+            f"{_base}/ilink/bot/get_bot_qrcode?bot_type=3"
+        ) as res:
+            data = await res.json(content_type=None)
+        qrcode = data["qrcode"]
+        qrcode_url = data.get("qrcode_img_content", qrcode)
+    except Exception as e:
+        print(f"[重连] 获取二维码失败: {e}")
+        reconnect_in_progress[0] = False
+        login_time_ref[0] = time.time()
+        return
+
+    # 发送二维码给用户（失败时控制台打印）
+    qr_msg = f"[重连] 请扫码完成新连接：{qrcode_url}"
+    print(qr_msg)
+    await send_msg_safe(session, from_id, ctx, qr_msg, bot_token_ref, bot_base_url_ref)
+
+    # 轮询扫码状态（带超时）
+    deadline = time.time() + cfg["qrcode_scan_timeout"]
+    new_token = None
+    new_base_url = None
+    while time.time() < deadline:
+        try:
+            async with session.get(
+                f"{_base}/ilink/bot/get_qrcode_status?qrcode={qrcode}"
+            ) as res:
+                status = await res.json(content_type=None)
+            if status.get("status") == "confirmed":
+                new_token = status["bot_token"]
+                new_base_url = status.get("baseurl", bot_base_url_ref[0])
+                break
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+
+    if new_token is None:
+        # 扫码超时：重置计时，不 crash
+        print("[重连] 扫码超时，重连未完成")
+        await send_msg_safe(session, from_id, ctx,
+                            "[失败] 扫码超时，重连未完成，下次到期前会再次提醒",
+                            bot_token_ref, bot_base_url_ref)
+        login_time_ref[0] = time.time()
+        reconnect_in_progress[0] = False
+        return
+
+    # 成功：原子替换 token 和 base_url
+    bot_token_ref[0] = new_token
+    bot_base_url_ref[0] = new_base_url
+    typing_ticket_cache.clear()
+    print("[重连] 新连接已建立，token 已切换")
+    await send_msg_safe(session, from_id, ctx,
+                        "[完成] 新连接已建立，已自动切换，继续使用",
+                        bot_token_ref, bot_base_url_ref)
+
+    reconnect_in_progress[0] = False
+    login_time_ref[0] = time.time()
+
+
 async def main():
     async with aiohttp.ClientSession() as session:
         # 1. 获取二维码

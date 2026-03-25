@@ -268,6 +268,7 @@ async def main():
         # 2. 等待扫码
         print("等待扫码...")
         bot_token = None
+        bot_base_url = ""
         while True:
             async with session.get(
                 f"{BASE_URL}/ilink/bot/get_qrcode_status?qrcode={qrcode}"
@@ -281,17 +282,33 @@ async def main():
                 break
             await asyncio.sleep(1)
 
-        # 3. 长轮询收消息
-        get_updates_buf = ""
-        # 按用户缓存 typing_ticket（有效期24h）
+        # 3. 共享状态（可变引用，传给定时器任务和消息循环）
+        bot_token_ref = [bot_token]
+        bot_base_url_ref = [bot_base_url]
+        last_contact = {"from_id": None, "context_token": None}
         typing_ticket_cache = {}
+        reconnect_asked = asyncio.Event()
+        warning_active = [False]
+        reconnect_in_progress = [False]
+        login_time_ref = [time.time()]
+
+        # 4. 启动定时器任务（与消息循环并发）
+        asyncio.create_task(reconnect_timer_task(
+            session, bot_token_ref, bot_base_url_ref, last_contact,
+            typing_ticket_cache, reconnect_asked, warning_active,
+            reconnect_in_progress, login_time_ref, RECONNECT_CONFIG,
+        ))
+
+        # 5. 长轮询收消息
+        get_updates_buf = ""
         print("开始监听消息...")
         while True:
             result = await api_post(
                 session,
                 "ilink/bot/getupdates",
                 {"get_updates_buf": get_updates_buf, "base_info": {"channel_version": "1.0.2"}},
-                bot_token,
+                bot_token_ref[0],
+                bot_base_url_ref[0] or None,
             )
             get_updates_buf = result.get("get_updates_buf") or get_updates_buf
 
@@ -303,6 +320,23 @@ async def main():
                 context_token = msg["context_token"]
                 print(f"收到消息: {text}")
 
+                # 更新最近联系人（定时器任务用于发通知）
+                last_contact["from_id"] = from_id
+                last_contact["context_token"] = context_token
+
+                # Y/N 重连询问处理（优先于 AI 回复）
+                if warning_active[0] and text.strip().upper() in ("Y", "N"):
+                    if text.strip().upper() == "Y":
+                        reconnect_asked.set()
+                        await send_msg_safe(session, from_id, context_token,
+                                            "好的，正在重新连接...",
+                                            bot_token_ref, bot_base_url_ref)
+                    else:
+                        await send_msg_safe(session, from_id, context_token,
+                                            "好的，稍后再提醒您",
+                                            bot_token_ref, bot_base_url_ref)
+                    continue
+
                 # getconfig 获取 typing_ticket（每个用户缓存一次）
                 if from_id not in typing_ticket_cache:
                     cfg = await api_post(
@@ -310,7 +344,8 @@ async def main():
                         "ilink/bot/getconfig",
                         {"ilink_user_id": from_id, "context_token": context_token,
                          "base_info": {"channel_version": "1.0.2"}},
-                        bot_token,
+                        bot_token_ref[0],
+                        bot_base_url_ref[0] or None,
                     )
                     typing_ticket_cache[from_id] = cfg.get("typing_ticket", "")
                 typing_ticket = typing_ticket_cache[from_id]
@@ -321,7 +356,8 @@ async def main():
                         session,
                         "ilink/bot/sendtyping",
                         {"ilink_user_id": from_id, "typing_ticket": typing_ticket, "status": 1},
-                        bot_token,
+                        bot_token_ref[0],
+                        bot_base_url_ref[0] or None,
                     )
 
                 # 调用 AI
@@ -346,7 +382,8 @@ async def main():
                         },
                         "base_info": {"channel_version": "1.0.2"},
                     },
-                    bot_token,
+                    bot_token_ref[0],
+                    bot_base_url_ref[0] or None,
                 )
                 print(f"sendmessage 返回: {send_result}")
                 print(f"已回复: {reply[:50]}...")
@@ -357,7 +394,8 @@ async def main():
                         session,
                         "ilink/bot/sendtyping",
                         {"ilink_user_id": from_id, "typing_ticket": typing_ticket, "status": 2},
-                        bot_token,
+                        bot_token_ref[0],
+                        bot_base_url_ref[0] or None,
                     )
 
 

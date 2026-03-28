@@ -102,7 +102,14 @@ def load_or_create_config() -> dict:
 # ==============================
 
 BASE_URL = "https://ilinkai.weixin.qq.com"
-COMMANDS_MSG = "连接成功！\n可用指令：\n/time - 查询当前连接剩余时间\n\n非指令输入即为接口/AI对话"
+COMMANDS_MSG = (
+    "连接成功！\n"
+    "可用指令：\n"
+    "/help  /指令   - 查看全部指令列表\n"
+    "/time          - 查询当前连接剩余时间\n"
+    "/重新连接       - 立即触发重新连接（需确认）\n"
+    "\n非指令输入即为 AI 对话"
+)
 
 
 def make_headers(token=None):
@@ -362,6 +369,7 @@ async def main():
         warning_active = [False]
         reconnect_in_progress = [False]
         login_time_ref = [time.time()]
+        manual_reconnect_pending = {}  # {from_id: True} 等待用户确认手动重连
 
         # 4. 启动定时器任务（与消息循环并发）
         asyncio.create_task(reconnect_timer_task(
@@ -395,7 +403,23 @@ async def main():
                 last_contact["from_id"] = from_id
                 last_contact["context_token"] = context_token
 
-                # Y/N 重连询问处理（优先于 AI 回复）
+                # 优先级 1：手动重连 Y/N 确认（/重新连接 发出后等待回复）
+                if manual_reconnect_pending.get(from_id) and text.strip().upper() in ("Y", "N"):
+                    del manual_reconnect_pending[from_id]
+                    if text.strip().upper() == "Y":
+                        await send_msg_safe(session, from_id, context_token,
+                                            "好的，正在重新连接...",
+                                            bot_token_ref, bot_base_url_ref)
+                        await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
+                                           typing_ticket_cache, reconnect_asked, warning_active,
+                                           reconnect_in_progress, login_time_ref, RECONNECT_CONFIG)
+                    else:
+                        await send_msg_safe(session, from_id, context_token,
+                                            "已取消重新连接",
+                                            bot_token_ref, bot_base_url_ref)
+                    continue
+
+                # 优先级 2：定时预警 Y/N 处理
                 if warning_active[0] and text.strip().upper() in ("Y", "N"):
                     if text.strip().upper() == "Y":
                         reconnect_asked.set()
@@ -408,9 +432,15 @@ async def main():
                                             bot_token_ref, bot_base_url_ref)
                     continue
 
-                # 首次交互：发送指令列表
+                # 优先级 3：首次交互，发送指令列表
                 if from_id not in welcomed_users:
                     welcomed_users.add(from_id)
+                    await send_msg_safe(session, from_id, context_token,
+                                        COMMANDS_MSG, bot_token_ref, bot_base_url_ref)
+                    continue
+
+                # /help  /指令 — 返回指令列表
+                if text.strip() in ("/help", "/指令"):
                     await send_msg_safe(session, from_id, context_token,
                                         COMMANDS_MSG, bot_token_ref, bot_base_url_ref)
                     continue
@@ -423,6 +453,19 @@ async def main():
                     await send_msg_safe(session, from_id, context_token,
                                         f"当前连接剩余时间：{_ts}",
                                         bot_token_ref, bot_base_url_ref)
+                    continue
+
+                # /重新连接 — 手动触发重连，等待 Y/N 确认
+                if text.strip() == "/重新连接":
+                    if reconnect_in_progress[0]:
+                        await send_msg_safe(session, from_id, context_token,
+                                            "重连正在进行中，请稍候...",
+                                            bot_token_ref, bot_base_url_ref)
+                    else:
+                        manual_reconnect_pending[from_id] = True
+                        await send_msg_safe(session, from_id, context_token,
+                                            "确认要立即重新连接吗？\n回复 Y 确认重连 / N 取消",
+                                            bot_token_ref, bot_base_url_ref)
                     continue
 
                 # getconfig 获取 typing_ticket（每个用户缓存一次）

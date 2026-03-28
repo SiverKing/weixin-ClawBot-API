@@ -83,7 +83,15 @@ async function loadOrCreateConfig() {
 }
 // ==============================
 
-const COMMANDS_MSG = "连接成功！\n可用指令：\n/time - 查询当前连接剩余时间\n\n非指令输入即为接口/AI对话";
+const COMMANDS_MSG = [
+  "连接成功！",
+  "可用指令：",
+  "/help  /指令   - 查看全部指令列表",
+  "/time          - 查询当前连接剩余时间",
+  "/重新连接       - 立即触发重新连接（需确认）",
+  "",
+  "非指令输入即为 AI 对话"
+].join("\n");
 
 // 共享状态（模块级）
 let botToken;
@@ -92,6 +100,7 @@ let getUpdatesBuf = "";
 const typingTicketCache = {};
 let lastContact = { fromId: null, contextToken: null };
 const welcomedUsers = new Set();
+const manualReconnectPending = new Set();  // 存放 fromId，等待用户确认手动重连
 let warningActive = false;
 let reconnectInProgress = false;
 let reconnectResolve = null;  // Y 回复时调用：reconnectResolve?.()
@@ -284,7 +293,19 @@ async function messageLoop() {
       // 更新最近联系人
       lastContact = { fromId, contextToken };
 
-      // Y/N 重连询问处理（优先于普通回复）
+      // 优先级 1：手动重连 Y/N 确认（/重新连接 发出后等待回复）
+      if (manualReconnectPending.has(fromId) && ["Y", "N"].includes(text?.trim()?.toUpperCase())) {
+        manualReconnectPending.delete(fromId);
+        if (text.trim().toUpperCase() === "Y") {
+          await sendMsgSafe(fromId, contextToken, "好的，正在重新连接...");
+          await doReconnect();
+        } else {
+          await sendMsgSafe(fromId, contextToken, "已取消重新连接");
+        }
+        continue;
+      }
+
+      // 优先级 2：定时预警 Y/N 处理
       if (warningActive && ["Y", "N"].includes(text?.trim()?.toUpperCase())) {
         if (text.trim().toUpperCase() === "Y") {
           reconnectResolve?.();
@@ -295,9 +316,15 @@ async function messageLoop() {
         continue;
       }
 
-      // 首次交互：发送指令列表
+      // 优先级 3：首次交互，发送指令列表
       if (!welcomedUsers.has(fromId)) {
         welcomedUsers.add(fromId);
+        await sendMsgSafe(fromId, contextToken, COMMANDS_MSG);
+        continue;
+      }
+
+      // /help  /指令 — 返回指令列表
+      if (["/help", "/指令"].includes(text?.trim())) {
         await sendMsgSafe(fromId, contextToken, COMMANDS_MSG);
         continue;
       }
@@ -310,6 +337,17 @@ async function messageLoop() {
         const s = Math.floor(rem % 60);
         const ts = h > 0 ? `${h} 小时 ${m} 分钟` : `${m} 分钟 ${s} 秒`;
         await sendMsgSafe(fromId, contextToken, `当前连接剩余时间：${ts}`);
+        continue;
+      }
+
+      // /重新连接 — 手动触发重连，等待 Y/N 确认
+      if (text?.trim() === "/重新连接") {
+        if (reconnectInProgress) {
+          await sendMsgSafe(fromId, contextToken, "重连正在进行中，请稍候...");
+        } else {
+          manualReconnectPending.add(fromId);
+          await sendMsgSafe(fromId, contextToken, "确认要立即重新连接吗？\n回复 Y 确认重连 / N 取消");
+        }
         continue;
       }
 

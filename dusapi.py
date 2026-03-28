@@ -2,7 +2,7 @@ import time
 import requests
 from dataclasses import dataclass, field
 # dusapi注册地址：https://dusapi.com
-version = "1.0.0"
+version = "1.0.1"
 
 # dusapi注册地址：https://dusapi.com
 def log(message, level="INFO"):
@@ -42,9 +42,10 @@ class DusAPI:
             "x-api-key": self.api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
-            'user-agent': f'siver-weixin_openclaw-api/{version}'
+            'user-agent': f'siver-weixin_clawbot-api/{version}'
         }
-        messages = [{"role": "user", "content": prompt}]
+        # Anthropic /v1/messages 格式：system 必须是顶层字段，messages 只允许 user/assistant
+        messages = []
         if history:
             for h in history:
                 role = "assistant" if h.get('attr') == 'self' else "user"
@@ -55,12 +56,14 @@ class DusAPI:
         payload = {
             "model": model,
             "max_tokens": 1024,
+            "system": prompt,
             "messages": messages,
         }
         api_endpoint = f"{self.base_url}/v1/messages"
+        # 梯度重试间隔（秒）：第1次失败后等2s，第2次4s，第3次8s，第4次16s，第5次32s
         retry_delays = [2, 4, 8, 16, 32]
-        max_retries = 5
-        last_error = None
+        max_retries  = 5
+        last_error   = None
 
         for attempt in range(max_retries + 1):
             try:

@@ -18,6 +18,8 @@
 
 - 腾讯 npm 包：`@tencent-weixin/openclaw-weixin@1.0.2`（41 个 TypeScript 源文件，完全公开）
 - 通过 unpkg CDN 直接获取：`https://unpkg.com/@tencent-weixin/openclaw-weixin@1.0.2/`
+- 腾讯官方 GitHub 仓库：`https://github.com/Tencent/openclaw-weixin`
+- 最新 2.x 线源码：`main` 分支，README 将 `2.0.x` 标记为 active/latest，`1.0.x` 为 legacy
 - 源码目录结构：
   ```
   src/
@@ -34,7 +36,7 @@
 
 | Endpoint | Method | 功能 |
 |---|---|---|
-| `/ilink/bot/get_bot_qrcode` | GET | 获取登录二维码（`?bot_type=3`） |
+| `/ilink/bot/get_bot_qrcode` | GET/POST | 获取登录二维码（`?bot_type=3`）。1.0.2 可 GET；2.x 官方实现使用 POST 并携带 `local_token_list` |
 | `/ilink/bot/get_qrcode_status` | GET | 轮询扫码状态（`?qrcode=xxx`） |
 | `/ilink/bot/getupdates` | POST | 长轮询收消息（核心，服务器 hold 35s） |
 | `/ilink/bot/getconfig` | POST | 获取 `typing_ticket`（**必须调用**） |
@@ -51,17 +53,30 @@
     "Content-Type": "application/json",
     "AuthorizationType": "ilink_bot_token",
     "X-WECHAT-UIN": base64(str(random_uint32)),  # 每次请求随机生成，防重放
+    "iLink-App-Id": "bot",                       # 2.x 新增/明确
+    "iLink-App-ClientVersion": "132099",         # 2.4.3 对应整数版本号
     "Authorization": f"Bearer {bot_token}",       # 登录后才有
 }
 ```
 
 `X-WECHAT-UIN` 的生成方式：随机生成一个 uint32，转十进制字符串，再 base64 编码。**每次请求都要重新生成**。
 
+2.x 还会在请求体的 `base_info` 中加入 `bot_agent`：
+
+```json
+{
+  "base_info": {
+    "channel_version": "2.4.3",
+    "bot_agent": "weixin-ClawBot-API/1.0.1 (python)"
+  }
+}
+```
+
 ### 2.4 完整消息流
 
 ```
 登录流程：
-  GET get_bot_qrcode → 得到 qrcode + qrcode_img_content（URL）
+  POST get_bot_qrcode?bot_type=3 → 得到 qrcode + qrcode_img_content（URL）
   GET get_qrcode_status（轮询） → status="confirmed" 时得到 bot_token
 
 收发消息流程（每条消息）：
@@ -76,6 +91,109 @@
 
 ---
 
+### 2.5 openclaw-weixin 2.x 增量逆向结果
+
+这次对比 2.x 源码后的结论：**基础文字私聊协议没有本质变化**。`getupdates`、`getconfig`、`sendtyping`、`sendmessage` 仍然是主路径，`context_token` 仍然必须从当前 inbound 消息原样带回。变化集中在登录流程、元信息、媒体字段和插件宿主能力。
+
+#### 登录流程变化
+
+1. 2.x 官方实现获取二维码时优先使用：
+
+```http
+POST /ilink/bot/get_bot_qrcode?bot_type=3
+```
+
+请求体：
+
+```json
+{
+  "local_token_list": []
+}
+```
+
+`local_token_list` 用于告诉服务端本地已有连接 token，处理重复扫码、已绑定连接等场景。本项目 Python 版保留兼容：POST 没拿到 `qrcode` 时自动退回旧版 GET。
+
+2. `get_qrcode_status` 不再只需要识别 `confirmed`。实际需要处理：
+
+| status | 含义 | Python 处理 |
+|---|---|---|
+| `wait` | 等待扫码 | 继续轮询 |
+| `scaned` | 已扫码，等待手机端确认 | 打印提示 |
+| `confirmed` | 已确认 | 读取 `bot_token`、`baseurl` |
+| `scaned_but_redirect` | 需要切换扫码状态轮询节点 | 使用 `redirect_host` 切换 base URL |
+| `binded_redirect` | 服务端认为已有连接/绑定跳转 | 重连时沿用当前 token；首次登录时刷新二维码 |
+| `need_verifycode` | 微信端要求数字配对码 | 终端提示用户输入手机显示的数字 |
+| `verify_code_blocked` | 配对码多次错误 | 刷新二维码 |
+| `expired` | 二维码过期 | 重新生成二维码 |
+
+#### 请求头与 base_info
+
+2.x 请求相比 1.0.2 多了宿主识别信息：
+
+```python
+headers = {
+    "Content-Type": "application/json",
+    "AuthorizationType": "ilink_bot_token",
+    "X-WECHAT-UIN": base64(str(random_uint32)),
+    "iLink-App-Id": "bot",
+    "iLink-App-ClientVersion": "132099",
+    "Authorization": f"Bearer {bot_token}",
+}
+```
+
+`132099` 是 `2.4.3` 的整数编码：`(2 << 16) | (4 << 8) | 3`。
+
+请求体中的 `base_info` 从：
+
+```json
+{ "channel_version": "1.0.2" }
+```
+
+扩展为：
+
+```json
+{
+  "channel_version": "2.4.3",
+  "bot_agent": "weixin-ClawBot-API/1.0.1 (python)"
+}
+```
+
+#### getupdates 字段
+
+`get_updates_buf` 仍是主游标字段。2.x 类型定义里也能看到兼容字段 `sync_buf`，但当前 Python 实现继续使用 `get_updates_buf`。响应里正式包含：
+
+```json
+{
+  "msgs": [],
+  "get_updates_buf": "...",
+  "longpolling_timeout_ms": 35000,
+  "errcode": 0
+}
+```
+
+#### 群聊字段结论
+
+2.x 的 `WeixinMessage` 类型里有 `group_id`、`session_id`，但官方插件能力声明仍是 `chatTypes: ["direct"]`，入站转换也把 `ChatType` 写死为 `direct`，发送消息时没有群聊分支。因此当前判断：
+
+- `group_id` 可用于识别/记录疑似群聊消息；
+- 不建议基于它宣称正式支持群聊；
+- 如果 `getupdates` 收到带 `group_id` 的消息，应先打印日志或忽略，避免误把群消息私聊回复给发言人。
+
+#### 媒体字段扩展
+
+2.x 类型定义中媒体相关字段更完整，包括：
+
+- `full_url`
+- `upload_full_url`
+- `aeskey`
+- `no_need_thumb`
+- `thumb_upload_param`
+- `ref_msg`
+
+这些字段对图片、语音、文件、视频、引用消息有用。本项目当前仍只实现文本收发，媒体消息需要继续实现 AES-128-ECB 加密、CDN 上传和 `item_list` 媒体引用。
+
+---
+
 ## 三、踩坑记录
 
 ### 踩坑 1：qrcode_img_content 是 URL 不是图片
@@ -84,7 +202,7 @@
 
 **原因**：`qrcode_img_content` 实际上是一个 HTTPS 链接（`https://liteapp.weixin.qq.com/q/...`），不是 base64 图片数据。
 
-**解法**：根据内容类型分支处理——以 `http` 开头就直接打印 URL，让用户手动在微信打开。
+**解法**：根据内容类型分支处理。以 `http` 开头时，优先下载二维码图片并在终端按黑白块渲染；缺少 `Pillow/qrcode` 依赖或下载失败时，退回打印 URL，让用户手动在微信打开。
 
 ---
 
@@ -129,6 +247,17 @@ data = await res.json(content_type=None)
 
 **解法**：补全所有缺失字段，并按 SDK 的完整流程实现 `getconfig` → `sendtyping(1)` → `sendmessage` → `sendtyping(2)`。
 
+2.x 迁移后，`base_info` 建议更新为：
+
+```json
+{
+  "channel_version": "2.4.3",
+  "bot_agent": "weixin-ClawBot-API/1.0.1 (python)"
+}
+```
+
+并且 `sendtyping` 请求体也补上 `base_info`，与官方 2.x 行为一致。
+
 ---
 
 ## 四、最终实现
@@ -140,6 +269,8 @@ data = await res.json(content_type=None)
 ├── bot.py        # 主程序：微信 iLink Bot（Python，推荐）
 ├── bot.js        # 主程序：微信 iLink Bot（Node.js）
 ├── dusapi.py     # AI 接口封装：兼容 Anthropic 格式的通用 API 客户端
+├── deepseek.py   # AI 接口封装：DeepSeek OpenAI-compatible /chat/completions
+├── requirements.txt
 └── config.json   # 运行时配置文件（首次运行自动生成）
 ```
 
@@ -156,6 +287,42 @@ class DusConfig:
     base_url: str
     model1: str = "claude-sonnet-4-5"
     prompt: str = "你是一个有帮助的AI助手。"
+```
+
+### deepseek.py — DeepSeek 接口封装
+
+DeepSeek 使用 OpenAI-compatible Chat Completions：
+
+```http
+POST https://api.deepseek.com/chat/completions
+Authorization: Bearer <api_key>
+Content-Type: application/json
+```
+
+默认模型为 `deepseek-v4-flash`，普通微信对话默认关闭 thinking：
+
+```json
+{
+  "model": "deepseek-v4-flash",
+  "messages": [
+    { "role": "system", "content": "你是一个有帮助的AI助手。" },
+    { "role": "user", "content": "你好" }
+  ],
+  "max_tokens": 1024,
+  "stream": false,
+  "thinking": { "type": "disabled" }
+}
+```
+
+配置由 `bot.py` 启动时选择 provider 后注入：
+
+```python
+ai = DeepSeekAPI(DeepSeekConfig(
+    api_key=_raw_cfg["api_key"],
+    base_url=_raw_cfg["base_url"],
+    model=_raw_cfg["model"],
+    prompt=_raw_cfg["prompt"],
+))
 ```
 
 ### bot.py — 主程序完整代码（v1.0.0 基础版，已迭代，见下方更新说明）
@@ -383,7 +550,10 @@ asyncio.run(main())
       { "type": 1, "text_item": { "text": "你好！有什么可以帮你？" } }
     ]
   },
-  "base_info": { "channel_version": "1.0.2" }
+  "base_info": {
+    "channel_version": "2.4.3",
+    "bot_agent": "weixin-ClawBot-API/1.0.1 (python)"
+  }
 }
 ```
 
@@ -403,17 +573,19 @@ asyncio.run(main())
 
 ```bash
 # 安装依赖
-pip install aiohttp requests
+pip install -r requirements.txt
 
 # 运行
 python bot.py
 ```
 
-运行后（v1.1.0+）：
-1. 首次运行进入交互式配置向导，填写 API Key 等信息保存到 `config.json`
-2. 再次运行显示当前配置（Key 脱敏），确认或重新配置
-3. 终端打印二维码 URL 及可用指令列表，手机扫码连接
-4. 给 Bot 发第一条消息，自动收到指令列表；后续消息走 AI 回复
+运行后：
+1. 启动时先选择 AI provider：`DusAPI` 或 `DeepSeek`
+2. 首次使用某 provider 时进入交互式配置向导，保存到 `config.json` 的 `providers.<name>` 下
+3. 再次运行显示当前 provider 配置（Key 脱敏），可确认、重新配置或切换 provider
+4. 终端打印二维码 URL；安装 `qrcode[pil]` / `Pillow` 后会直接渲染二维码
+5. 手机扫码连接，如出现数字配对码，按终端提示输入
+6. 给 Bot 发第一条消息，自动收到指令列表；后续消息走 AI 回复
 
 ---
 
@@ -430,6 +602,8 @@ python bot.py
 5. **媒体消息**（图片/视频/文件）需要先 AES-128-ECB 加密上传到 CDN，再在 `item_list` 中引用 CDN 参数，本文未实现，仅支持文本。
 
 6. **`config.json` 含有 API Key**，请勿提交到版本控制。
+
+7. **群聊字段当前只适合识别，不适合作为正式群聊功能**。2.x 类型中有 `group_id`，但官方插件能力仍声明 direct chat，发送路径没有群聊分支。
 
 ---
 
@@ -505,4 +679,66 @@ RECONNECT_CONFIG = {
 
 ---
 
-*基于 `@tencent-weixin/openclaw-weixin@1.0.2` 逆向分析 + Python/Node.js 实测，截止 2026 年 3 月。*
+### v1.2.0（2026-05）
+
+基于 `@tencent-weixin/openclaw-weixin` 2.x 源码继续逆向，Python 版新增以下变化：
+
+#### 2.x 登录流程适配
+
+- `get_bot_qrcode` 改为 POST 优先，并携带 `local_token_list`
+- POST 未返回 `qrcode` 时自动回退旧版 GET
+- `get_qrcode_status` 支持 `scaned`、`scaned_but_redirect`、`binded_redirect`、`need_verifycode`、`verify_code_blocked`、`expired`
+- 支持手机端数字配对码输入
+- 支持扫码轮询节点跳转：`scaned_but_redirect` + `redirect_host`
+
+#### 2.x 元信息补齐
+
+- Header 增加 `iLink-App-Id: bot`
+- Header 增加 `iLink-App-ClientVersion`
+- `base_info` 增加 `bot_agent`
+- `sendtyping` 请求体也携带 `base_info`
+
+#### 终端二维码
+
+- `qrcode_img_content` 为 URL 时，优先尝试下载二维码图片并渲染到终端
+- 缺少 `Pillow/qrcode` 或下载失败时回退打印 URL
+- 依赖统一写入 `requirements.txt`
+
+#### 多 AI provider 配置
+
+`config.json` 从旧版扁平结构：
+
+```json
+{
+  "api_key": "your-api-key",
+  "base_url": "https://api.dusapi.com",
+  "model": "gpt-5",
+  "prompt": "..."
+}
+```
+
+迁移为：
+
+```json
+{
+  "provider": "deepseek",
+  "providers": {
+    "dusapi": {
+      "api_key": "...",
+      "base_url": "https://api.dusapi.com",
+      "model": "gpt-5",
+      "prompt": "..."
+    },
+    "deepseek": {
+      "api_key": "...",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-v4-flash",
+      "prompt": "..."
+    }
+  }
+}
+```
+
+启动时先选择 provider，再确认或创建对应配置。旧版扁平配置会自动迁移到 `providers.dusapi`。
+
+*基于 `@tencent-weixin/openclaw-weixin@1.0.2` 与官方 2.x 源码逆向分析 + Python/Node.js 实测，最近更新至 2026 年 5 月。*

@@ -8,18 +8,18 @@
 
 2026 年腾讯通过 [OpenClaw](https://docs.openclaw.ai) 平台正式开放了微信个人账号的 Bot API，官方名称为 **微信 ClawBot 插件功能**，底层协议为 **iLink**，接入域名 `ilinkai.weixin.qq.com` 为腾讯官方服务器。
 
-本项目提供 Python 和 Node.js 两种实现，可直接接入兼容 Anthropic 格式的 AI 接口（Claude、GPT 等），实现收到微信消息后自动 AI 回复。**免 openclaw 部署和登录，直接接入与调用。**
+本项目提供 Python 和 Node.js 两种实现，可直接接入 DusAPI、DeepSeek 等 AI 接口，实现收到微信消息后自动 AI 回复。**免 openclaw 部署和登录，直接接入与调用。**
 
 ---
 
 ## 功能
 
-- 扫码登录微信（生成二维码链接）
+- 扫码登录微信（支持终端二维码渲染，缺少依赖时回退二维码链接）
 - 长轮询实时接收消息
-- 调用 AI 接口生成回复
+- 调用 AI 接口生成回复（Python 版支持 DusAPI / DeepSeek provider 选择）
 - 发送前显示"正在输入"状态
 - 内置梯度重试（AI 接口失败自动重试）
-- **配置文件管理**：首次运行引导创建，支持交互式修改，API Key 脱敏显示
+- **配置文件管理**：单个 `config.json` 分 provider 存放配置，启动时选择 AI 提供商，API Key 脱敏显示
 - **24 小时自动重连**：到期前预警 → 用户确认 → 无缝切换新连接，全程不断线
 - **Bot 指令系统**：`/help` `/指令` 查看指令列表，`/time` 查询剩余连接时间，`/重新连接` 手动触发重连，首次交互自动推送指令列表
 
@@ -32,6 +32,8 @@
 ├── bot.py         # Python 实现（推荐）
 ├── bot.js         # Node.js 实现
 ├── dusapi.py      # AI 接口封装（Python，兼容 Anthropic 格式）
+├── deepseek.py    # DeepSeek 接口封装（Python，OpenAI-compatible）
+├── requirements.txt
 ├── config.json    # 配置文件（首次运行自动生成，勿提交到版本控制）
 └── README.md
 ```
@@ -46,7 +48,7 @@
 
 **安装依赖：**
 ```bash
-pip install aiohttp requests
+pip install -r requirements.txt
 ```
 
 **运行：**
@@ -54,7 +56,7 @@ pip install aiohttp requests
 python bot.py
 ```
 
-首次运行会自动引导配置，按提示填写即可。
+首次运行会先选择 AI 提供商，再引导填写该提供商的 API Key、接口地址、模型和系统提示词。
 
 ---
 
@@ -76,44 +78,68 @@ node bot.js
 
 ### 登录流程
 
-1. 运行后若无配置文件，进入交互式配置向导
-2. 配置完成后终端打印二维码链接
-3. 将链接在手机微信中打开，按提示连接
-4. 扫码确认后终端显示"登录成功"及可用指令列表
-5. 在微信中向 Bot 发送第一条消息，Bot 自动回复指令列表
-6. 之后的消息均由 AI 自动回复
+1. 运行后先选择 AI 提供商，并确认或创建对应配置
+2. 配置完成后终端打印扫码地址，并在安装 `qrcode[pil]` / `Pillow` 时直接渲染二维码
+3. 手机微信扫码或打开链接，按提示连接
+4. 如微信要求数字配对码，按终端提示输入手机端显示的数字
+5. 扫码确认后终端显示"登录成功"及可用指令列表
+6. 在微信中向 Bot 发送第一条消息，Bot 自动回复指令列表
+7. 之后的消息均由 AI 自动回复
 
 ---
 
 ## 配置文件（config.json）
 
-首次运行自动生成，交互式填写，留空使用默认值。
+首次运行自动生成，所有 AI provider 配置都存放在同一个文件里，通过 `provider` 指定当前启用项。旧版扁平配置会自动迁移到 `providers.dusapi`。
 
 ```json
 {
-  "api_key": "your-api-key",
-  "base_url": "https://api.dusapi.com",
-  "model": "gpt-5",
-  "prompt": "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些"
+  "provider": "deepseek",
+  "providers": {
+    "dusapi": {
+      "api_key": "your-dusapi-key",
+      "base_url": "https://api.dusapi.com",
+      "model": "gpt-5",
+      "prompt": "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些"
+    },
+    "deepseek": {
+      "api_key": "your-deepseek-key",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-v4-flash",
+      "prompt": "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些"
+    }
+  }
 }
 ```
 
-再次运行时会显示当前配置（API Key 仅显示首尾各 5 位），选择继续或重新配置：
+再次运行时会先选择提供商，再显示该提供商配置（API Key 仅显示首尾各 5 位），选择继续、重新配置或切换提供商：
 
 ```
+请选择 AI 提供商：
+  1. DusAPI
+  2. DeepSeek （默认）
+
 ============================================================
-  检测到配置文件，当前配置如下：
+  当前选择：DeepSeek
+  当前配置如下：
 ============================================================
   API Key  : sk-d0*****************************e8c5c
-  API 地址 : https://api.dusapi.com
-  模型     : gpt-5
+  API 地址 : https://api.deepseek.com
+  模型     : deepseek-v4-flash
   提示词   : 你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量...
 ------------------------------------------------------------
 
-使用此配置继续？(直接回车或输入 Y 继续 / 输入 N 重新配置):
+使用此配置继续？(直接回车或输入 Y 继续 / 输入 N 重新配置 / 输入 S 切换提供商):
 ```
 
-> **注意**：当前版本仅支持 [DusAPI](https://dusapi.com)。如需接入其他接口，请拉取源代码自行修改 `dusapi.py`。
+### AI provider
+
+| Provider | 文件 | 接口格式 | 默认地址 | 默认模型 |
+|---|---|---|---|---|
+| DusAPI | `dusapi.py` | Anthropic `/v1/messages` | `https://api.dusapi.com` | `gpt-5` |
+| DeepSeek | `deepseek.py` | OpenAI-compatible `/chat/completions` | `https://api.deepseek.com` | `deepseek-v4-flash` |
+
+DeepSeek 调用使用 `Authorization: Bearer <api_key>`，普通聊天默认关闭 `deepseek-v4-flash` 的 thinking。
 
 ---
 
@@ -203,7 +229,18 @@ RECONNECT_CONFIG = {
 Content-Type: application/json
 AuthorizationType: ilink_bot_token
 X-WECHAT-UIN: <随机uint32转base64，每次请求重新生成>
+iLink-App-Id: bot
+iLink-App-ClientVersion: <2.x 客户端版本号>
 Authorization: Bearer <bot_token>
+```
+
+Python 版当前按 openclaw-weixin 2.x 风格补充 `base_info`：
+
+```json
+{
+  "channel_version": "2.4.3",
+  "bot_agent": "weixin-ClawBot-API/1.0.1 (python)"
+}
 ```
 
 ### 消息收发流程
@@ -241,7 +278,10 @@ POST getupdates（长轮询，服务器 hold 35s）
       { "type": 1, "text_item": { "text": "回复内容" } }
     ]
   },
-  "base_info": { "channel_version": "1.0.2" }
+  "base_info": {
+    "channel_version": "2.4.3",
+    "bot_agent": "weixin-ClawBot-API/1.0.1 (python)"
+  }
 }
 ```
 
@@ -263,7 +303,7 @@ POST getupdates（长轮询，服务器 hold 35s）
 
 | 环境 | 依赖 |
 |---|---|
-| Python | `aiohttp`、`requests` |
+| Python | 见 `requirements.txt`：`aiohttp`、`requests`、`qrcode[pil]`、`pyinstaller`（打包用） |
 | Node.js | 无需额外安装（Node.js 18+ 内置 fetch 和 readline） |
 
 ---

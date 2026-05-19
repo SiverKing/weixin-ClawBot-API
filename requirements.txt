@@ -1,0 +1,6 @@
+aiohttp>=3.9.0
+requests>=2.31.0
+qrcode[pil]>=7.4.2
+
+# Optional: only needed when building an executable from bot.spec.
+pyinstaller>=6.0.0

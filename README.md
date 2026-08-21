@@ -1,8 +1,8 @@
 # 微信 Claw Bot（Python）
 
-这是一个直接调用腾讯微信 iLink Bot 接口的 Python 客户端示例。它无需部署 OpenClaw，即可通过扫码登录微信个人账号，并把收到的文字消息交给 DusAPI 或 DeepSeek 生成回复。
+这是一个直接调用腾讯 [OpenClaw Weixin](https://github.com/Tencent/openclaw-weixin)（iLink Bot）接口的 Python 客户端示例。它无需部署 OpenClaw，即可通过扫码登录微信个人账号，并把收到的文字消息交给 DusAPI 或 DeepSeek 生成回复。
 
-当前运行代码按腾讯微信 iLink Bot 2.4.6 的公开 HTTP 行为对齐。协议细节和版本差异记录在 [weixin-openclaw-api-py-docs.md](weixin-openclaw-api-py-docs.md)。
+当前运行代码按 [OpenClaw Weixin](https://github.com/Tencent/openclaw-weixin) 2.4.6 的公开 HTTP 行为对齐。协议细节和版本差异记录在 [weixin-openclaw-api-py-docs.md](weixin-openclaw-api-py-docs.md)。
 
 ## 更强大的选择：Siver WX机器人（wxbot_plus）
 
@@ -109,7 +109,7 @@ python bot.py
 
 这些是客户端调度参数，不是服务端承诺的固定 token 生命周期。服务端明确返回 `ret=-14` 或 `errcode=-14` 时，程序会停止紧密轮询并重新走二维码登录。
 
-## iLink 2.4.6 协议要点
+## OpenClaw Weixin 2.4.6 协议要点
 
 ### 请求头与基础信息
 

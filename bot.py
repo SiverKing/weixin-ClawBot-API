@@ -1,15 +1,18 @@
 import asyncio
 import base64
 import io
+import inspect
 import json
 import os
-import random
 import re
-import aiohttp
+import secrets
 import time
 import urllib.request
 from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
+
+import aiohttp
+
 from dusapi import DusAPI, DusConfig
 from deepseek import DeepSeekAPI, DeepSeekConfig
 
@@ -25,17 +28,34 @@ RECONNECT_CONFIG = {
     "warning_before":       2 * 3600,  # 提前多久发出警告（秒）
     "reminder_interval":      30 * 60, # 用户回 N 后多久再问（秒）
     "force_before":           30 * 60, # 最后多久强制重连（秒）
-    "qrcode_scan_timeout":       600,  # 等待用户扫码最长时间（秒）
+    "qrcode_scan_timeout":       480,  # 官方客户端默认整体等待时长（秒）
 }
 # =============================================
 
 # ========== 配置文件 ==========
 CONFIG_FILE = "config.json"
+STATE_FILE = "weixin_state.json"
 _DEFAULT_PROMPT = "你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量少一些"
-CHANNEL_VERSION = "2.4.3"
+CHANNEL_VERSION = "2.4.6"
 ILINK_APP_ID = "bot"
-ILINK_APP_CLIENT_VERSION = str((2 << 16) | (4 << 8) | 3)
-BOT_AGENT = "weixin-ClawBot-API/1.0.1 (python)"
+ILINK_APP_CLIENT_VERSION = str((2 << 16) | (4 << 8) | 6)
+BOT_AGENT = "weixin-ClawBot-API/1.2.0 (python)"
+DEFAULT_BOT_AGENT = "OpenClaw"
+BOT_AGENT_MAX_LEN = 256
+
+# iLink 2.4.6 官方客户端默认超时。长轮询超时属于正常控制流，不能当作业务失败。
+QR_STATUS_TIMEOUT = 35
+LONG_POLL_TIMEOUT = 35
+API_TIMEOUT = 15
+CONFIG_TIMEOUT = 10
+CONFIG_CACHE_TTL = 24 * 60 * 60
+CONFIG_CACHE_INITIAL_RETRY = 2
+CONFIG_CACHE_MAX_RETRY = 60 * 60
+MAX_QR_REFRESH_COUNT = 3
+MAX_CONSECUTIVE_FAILURES = 3
+RETRY_DELAY = 2
+BACKOFF_DELAY = 30
+MAX_LONG_POLL_TIMEOUT = 120
 
 PROVIDERS = {
     "dusapi": {
@@ -87,6 +107,107 @@ def load_config_file() -> dict:
 def save_config_file(cfg: dict):
     with open(CONFIG_FILE, "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+def _empty_runtime_state() -> dict:
+    return {
+        "bot_token": "",
+        "baseurl": "",
+        "ilink_bot_id": "",
+        "ilink_user_id": "",
+        "get_updates_buf": "",
+        "contexts": {},
+        "last_contact": {"from_id": "", "context_token": ""},
+    }
+
+
+def load_runtime_state() -> dict:
+    """加载 iLink 运行状态；token、游标和上下文按本地账号隔离保存。"""
+    state = _empty_runtime_state()
+    if not os.path.exists(STATE_FILE):
+        return state
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            state.update({k: raw.get(k, v) for k, v in state.items()})
+            if not isinstance(state.get("contexts"), dict):
+                state["contexts"] = {}
+            if not isinstance(state.get("last_contact"), dict):
+                state["last_contact"] = {"from_id": "", "context_token": ""}
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"[状态] 无法读取 {STATE_FILE}，将从空状态开始: {exc}")
+    return state
+
+
+def save_runtime_state(state: dict):
+    """原子保存 token、baseurl、get_updates_buf 和 context_token。"""
+    temp_file = f"{STATE_FILE}.tmp"
+    try:
+        with open(temp_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(temp_file, STATE_FILE)
+    except (OSError, TypeError, ValueError) as exc:
+        print(f"[状态] 保存 {STATE_FILE} 失败: {exc}")
+        try:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        except OSError:
+            pass
+
+
+def sanitize_bot_agent(raw: str | None) -> str:
+    """按 2.4.6 的 UA 风格规则清洗 bot_agent，避免非法元数据污染请求。"""
+    if not isinstance(raw, str) or not raw.strip():
+        return DEFAULT_BOT_AGENT
+
+    product_re = re.compile(r"^[A-Za-z0-9_.-]{1,32}/[A-Za-z0-9_.+\-]{1,32}$")
+    comment_re = re.compile(r"^[\x20-\x27\x2A-\x7E]{1,64}$")
+    raw_tokens = raw.strip().split()
+    tokens = []
+    i = 0
+    while i < len(raw_tokens):
+        token = raw_tokens[i]
+        if token.startswith("(") and not token.endswith(")"):
+            while i + 1 < len(raw_tokens) and not token.endswith(")"):
+                i += 1
+                token += " " + raw_tokens[i]
+        tokens.append(token)
+        i += 1
+
+    accepted = []
+    pending = None
+    for token in tokens:
+        if token.startswith("(") and token.endswith(")"):
+            comment = token[1:-1]
+            if pending and comment_re.fullmatch(comment):
+                accepted.append(f"{pending} ({comment})")
+                pending = None
+            elif pending:
+                accepted.append(pending)
+                pending = None
+            continue
+        if pending:
+            accepted.append(pending)
+        pending = token if product_re.fullmatch(token) else None
+    if pending:
+        accepted.append(pending)
+
+    if not accepted:
+        return DEFAULT_BOT_AGENT
+
+    result = " ".join(accepted)
+    if len(result.encode("utf-8")) <= BOT_AGENT_MAX_LEN:
+        return result
+    kept = []
+    size = 0
+    for token in accepted:
+        extra = len(token.encode("utf-8")) + (1 if kept else 0)
+        if size + extra > BOT_AGENT_MAX_LEN:
+            break
+        kept.append(token)
+        size += extra
+    return " ".join(kept) if kept else DEFAULT_BOT_AGENT
 
 
 def choose_provider(default_provider: str) -> str:
@@ -191,58 +312,251 @@ COMMANDS_MSG = (
 )
 
 
+class ILinkAPIError(RuntimeError):
+    """iLink HTTP、JSON 或业务层错误。"""
+
+    def __init__(self, message, *, path="", status=None, ret=None, errcode=None,
+                 response=None, network_type=None):
+        super().__init__(message)
+        self.path = path
+        self.status = status
+        self.ret = ret
+        self.errcode = errcode
+        self.response = response or {}
+        self.network_type = network_type
+
+    @property
+    def code(self):
+        return self.ret if self.ret not in (None, 0) else self.errcode
+
+    @property
+    def is_stale_token(self):
+        return self.code == -14
+
+
+def make_common_headers():
+    """2.4.6 GET/POST 共用的最小应用头。"""
+    return {
+        "iLink-App-Id": ILINK_APP_ID,
+        "iLink-App-ClientVersion": ILINK_APP_CLIENT_VERSION,
+    }
+
+
 def make_headers(token=None):
-    uin = str(random.randint(0, 0xFFFFFFFF))
+    """2.4.6 业务 POST 请求头；不手动设置 Content-Length。"""
+    uin = str(secrets.randbits(32))
     headers = {
         "Content-Type": "application/json",
         "AuthorizationType": "ilink_bot_token",
         "X-WECHAT-UIN": base64.b64encode(uin.encode()).decode(),
-        "iLink-App-Id": ILINK_APP_ID,
-        "iLink-App-ClientVersion": ILINK_APP_CLIENT_VERSION,
+        **make_common_headers(),
     }
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    if token and str(token).strip():
+        headers["Authorization"] = f"Bearer {str(token).strip()}"
     return headers
 
 
 def base_info():
     return {
         "channel_version": CHANNEL_VERSION,
-        "bot_agent": BOT_AGENT,
+        "bot_agent": sanitize_bot_agent(BOT_AGENT),
     }
 
 
-async def api_get(session, path, token=None, base_url=None):
-    url = f"{base_url or BASE_URL}/{path}"
-    async with session.get(url, headers=make_headers(token)) as res:
-        text = await res.text()
-        print(f"  [GET {path}] HTTP {res.status} → {text[:200]}")
-        try:
-            return json.loads(text)
-        except Exception:
-            return {}
+def generate_client_id() -> str:
+    """生成与 2.4.6 客户端格式一致、可用于消息幂等的唯一 ID。"""
+    return f"openclaw-weixin:{int(time.time() * 1000)}-{secrets.token_hex(4)}"
 
 
-async def api_post(session, path, body, token=None, base_url=None):
-    url = f"{base_url or BASE_URL}/{path}"
-    async with session.post(url, json=body, headers=make_headers(token)) as res:
-        text = await res.text()
-        print(f"  [{path}] HTTP {res.status} → {text[:200]}")
+def _redact_text(value):
+    """避免把 token、二维码和上下文凭据写入终端日志。"""
+    if isinstance(value, (dict, list, tuple)):
         try:
-            import json
-            return json.loads(text)
-        except Exception:
-            return {}
+            text = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            text = str(value or "")
+    else:
+        text = str(value or "")
+    patterns = (
+        r"(?i)(bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param)=([^&\s,}\"]+)",
+        r'(?i)("(?:bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param)"\s*:\s*")([^"]+)(")',
+        r"(?i)('(?:bot_token|token|context_token|typing_ticket|qrcode|qrcode_img_content|verify_code|aeskey|aes_key|encrypt_query_param)'\s*:\s*')([^']+)(')",
+        r'(?i)("local_token_list"\s*:\s*)\[[^\]]*\]',
+    )
+    for index, pattern in enumerate(patterns):
+        if index == len(patterns) - 1:
+            text = re.sub(pattern, r"\1[***]", text)
+        else:
+            text = re.sub(pattern, lambda m: f"{m.group(1)}***{m.group(3) if m.lastindex and m.lastindex >= 3 else ''}", text)
+    return text[:500]
+
+
+def _redact_path(path):
+    # 查询串通常包含二维码、配对码或签名；保留参数名便于排障，不记录值。
+    path = re.sub(r"(?i)([?&](?:qrcode|verify_code)=)[^&]*", r"\1***", str(path))
+    return _redact_text(path)
+
+
+def _network_type(exc):
+    text = str(exc).upper()
+    if any(code in text for code in ("ENOTFOUND", "EAI_AGAIN", "GETADDRINFO")):
+        return "dns"
+    if any(code in text for code in ("ECONNREFUSED", "ETIMEDOUT", "ENETUNREACH", "EHOSTUNREACH", "CONNECT_TIMEOUT")):
+        return "tcp"
+    if any(code in text for code in ("SSL", "TLS", "CERT", "UNABLE_TO_VERIFY")):
+        return "tls"
+    if isinstance(exc, asyncio.TimeoutError) or "TIMEOUT" in text:
+        return "timeout"
+    return "unknown"
+
+
+def _parse_json_response(text, path, status):
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError) as exc:
+        raise ILinkAPIError(
+            f"{path} 返回内容不是有效 JSON: {exc}",
+            path=path,
+            status=status,
+        ) from exc
+    if not isinstance(data, dict):
+        raise ILinkAPIError(
+            f"{path} 返回 JSON 类型错误: {type(data).__name__}",
+            path=path,
+            status=status,
+        )
+    return data
+
+
+def _log_response(method, path, status, text):
+    print(f"  [{method} {_redact_path(path)}] HTTP {status} → {_redact_text(text)}")
+
+
+def ensure_business_success(data, path):
+    """检查 ret/errcode；字段缺省按官方客户端兼容规则视为成功。"""
+    ret = data.get("ret")
+    errcode = data.get("errcode")
+    if ret not in (None, 0) or errcode not in (None, 0):
+        message = data.get("errmsg") or "iLink 业务请求失败"
+        raise ILinkAPIError(
+            f"{path} ret={ret!r} errcode={errcode!r}: {message}",
+            path=path,
+            ret=ret,
+            errcode=errcode,
+            response=data,
+        )
+    return data
+
+
+async def api_get(session, path, token=None, base_url=None, *, timeout=QR_STATUS_TIMEOUT,
+                  long_poll=False):
+    """执行 GET；二维码状态长轮询超时返回 wait，其余错误抛出。"""
+    del token  # 2.4.6 官方 GET 二维码状态只发送公共应用头，不发送 Bearer。
+    url = f"{(base_url or BASE_URL).rstrip('/')}/{path.lstrip('/')}"
+    try:
+        client_timeout = aiohttp.ClientTimeout(total=timeout) if timeout else None
+        async with session.get(url, headers=make_common_headers(), timeout=client_timeout) as res:
+            text = await res.text()
+            _log_response("GET", path, res.status, text)
+            if not 200 <= res.status < 300:
+                error_data = {}
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        error_data = parsed
+                except (TypeError, ValueError):
+                    pass
+                raise ILinkAPIError(
+                    f"GET {path} HTTP {res.status}: {error_data.get('errmsg', '')}".rstrip(),
+                    path=path,
+                    status=res.status,
+                    ret=error_data.get("ret"),
+                    errcode=error_data.get("errcode"),
+                    response=error_data,
+                )
+            return _parse_json_response(text, path, res.status)
+    except asyncio.TimeoutError as exc:
+        if long_poll:
+            return {"status": "wait", "_timeout": True}
+        raise ILinkAPIError(
+            f"GET {path} 超时", path=path, network_type="timeout",
+        ) from exc
+    except asyncio.CancelledError:
+        raise
+    except ILinkAPIError:
+        raise
+    except (aiohttp.ClientError, OSError) as exc:
+        kind = _network_type(exc)
+        raise ILinkAPIError(
+            f"GET {path} 网络错误({kind}): {exc}",
+            path=path,
+            network_type=kind,
+        ) from exc
+
+
+async def api_post(session, path, body, token=None, base_url=None, *, timeout=API_TIMEOUT,
+                   long_poll=False, fallback_cursor=""):
+    """执行 JSON POST；不手动设置 Content-Length。"""
+    url = f"{(base_url or BASE_URL).rstrip('/')}/{path.lstrip('/')}"
+    try:
+        client_timeout = aiohttp.ClientTimeout(total=timeout) if timeout else None
+        async with session.post(
+            url,
+            json=body,
+            headers=make_headers(token),
+            timeout=client_timeout,
+        ) as res:
+            text = await res.text()
+            _log_response("POST", path, res.status, text)
+            if not 200 <= res.status < 300:
+                error_data = {}
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, dict):
+                        error_data = parsed
+                except (TypeError, ValueError):
+                    pass
+                raise ILinkAPIError(
+                    f"POST {path} HTTP {res.status}: {error_data.get('errmsg', '')}".rstrip(),
+                    path=path,
+                    status=res.status,
+                    ret=error_data.get("ret"),
+                    errcode=error_data.get("errcode"),
+                    response=error_data,
+                )
+            return _parse_json_response(text, path, res.status)
+    except asyncio.TimeoutError as exc:
+        if long_poll:
+            return {
+                "ret": 0,
+                "msgs": [],
+                "get_updates_buf": fallback_cursor,
+                "_timeout": True,
+            }
+        raise ILinkAPIError(
+            f"POST {path} 超时", path=path, network_type="timeout",
+        ) from exc
+    except asyncio.CancelledError:
+        raise
+    except ILinkAPIError:
+        raise
+    except (aiohttp.ClientError, OSError) as exc:
+        kind = _network_type(exc)
+        raise ILinkAPIError(
+            f"POST {path} 网络错误({kind}): {exc}",
+            path=path,
+            network_type=kind,
+        ) from exc
 
 
 async def send_msg_safe(session, to_id, context_token, text, bot_token_ref, bot_base_url_ref):
     """发送微信消息，失败时降级为控制台打印，不抛异常。"""
     if not to_id or not context_token:
-        print(f"[重连通知] {text}")
-        return
+        print(f"[重连通知] {_redact_text(text)}")
+        return False
     try:
-        client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
-        await api_post(
+        client_id = generate_client_id()
+        result = await api_post(
             session,
             "ilink/bot/sendmessage",
             {
@@ -259,15 +573,128 @@ async def send_msg_safe(session, to_id, context_token, text, bot_token_ref, bot_
             },
             bot_token_ref[0],
             bot_base_url_ref[0] or None,
+            timeout=API_TIMEOUT,
         )
+        ensure_business_success(result, "sendmessage")
+        safe_text = _redact_text(text)
+        print(f"[消息] 已发送: {safe_text[:50]}{'...' if len(safe_text) > 50 else ''}")
+        return True
+    except ILinkAPIError as exc:
+        if exc.is_stale_token:
+            raise
+        print(f"[重连通知] 发送失败({_redact_text(exc)})，降级打印: {_redact_text(text)}")
+        return False
     except Exception as e:
-        print(f"[重连通知] 发送失败({e})，降级打印: {text}")
+        print(f"[重连通知] 发送失败({_redact_text(e)})，降级打印: {_redact_text(text)}")
+        return False
+
+
+async def send_typing_safe(session, user_id, typing_ticket, status,
+                           bot_token_ref, bot_base_url_ref):
+    """尽力发送输入状态；失效 token 继续向上抛出以触发受控重登录。"""
+    if not user_id or not typing_ticket:
+        return False
+    try:
+        result = await api_post(
+            session,
+            "ilink/bot/sendtyping",
+            {
+                "ilink_user_id": user_id,
+                "typing_ticket": typing_ticket,
+                "status": status,
+                "base_info": base_info(),
+            },
+            bot_token_ref[0],
+            bot_base_url_ref[0] or None,
+            timeout=CONFIG_TIMEOUT,
+        )
+        ensure_business_success(result, "sendtyping")
+        return True
+    except ILinkAPIError as exc:
+        if exc.is_stale_token:
+            raise
+        print(f"[输入状态] status={status} 发送失败: {_redact_text(exc)}")
+        return False
+
+
+async def get_typing_ticket_safe(session, user_id, context_token, cache,
+                                 bot_token_ref, bot_base_url_ref):
+    """按用户缓存 getconfig；失败时指数退避，但不阻断正常文字回复。"""
+    now = time.time()
+    entry = cache.get(user_id)
+    if not isinstance(entry, dict):
+        entry = None
+
+    if entry is None or now >= float(entry.get("next_fetch_at", 0)):
+        fetch_ok = False
+        try:
+            result = await api_post(
+                session,
+                "ilink/bot/getconfig",
+                {
+                    "ilink_user_id": user_id,
+                    "context_token": context_token,
+                    "base_info": base_info(),
+                },
+                bot_token_ref[0],
+                bot_base_url_ref[0] or None,
+                timeout=CONFIG_TIMEOUT,
+            )
+            ensure_business_success(result, "getconfig")
+            cache[user_id] = {
+                "typing_ticket": str(result.get("typing_ticket") or ""),
+                "next_fetch_at": now + secrets.randbelow(CONFIG_CACHE_TTL + 1),
+                "retry_delay": CONFIG_CACHE_INITIAL_RETRY,
+            }
+            fetch_ok = True
+        except ILinkAPIError as exc:
+            if exc.is_stale_token:
+                raise
+            print(f"[配置] getconfig 失败，忽略输入状态: {_redact_text(exc)}")
+        except Exception as exc:
+            print(f"[配置] getconfig 异常，忽略输入状态: {_redact_text(exc)}")
+
+        if not fetch_ok:
+            if entry is None:
+                cache[user_id] = {
+                    "typing_ticket": "",
+                    "next_fetch_at": now + CONFIG_CACHE_INITIAL_RETRY,
+                    "retry_delay": CONFIG_CACHE_INITIAL_RETRY,
+                }
+            else:
+                previous_delay = max(
+                    CONFIG_CACHE_INITIAL_RETRY,
+                    float(entry.get("retry_delay", CONFIG_CACHE_INITIAL_RETRY)),
+                )
+                next_delay = min(previous_delay * 2, CONFIG_CACHE_MAX_RETRY)
+                entry["next_fetch_at"] = now + next_delay
+                entry["retry_delay"] = next_delay
+
+    cached = cache.get(user_id) or {}
+    return str(cached.get("typing_ticket") or "")
+
+
+def extract_message_text(msg: dict) -> str:
+    """遍历完整 item_list，提取文本/语音转写，避免只读取第一项。"""
+    parts = []
+    for item in msg.get("item_list") or []:
+        if not isinstance(item, dict):
+            continue
+        text_item = item.get("text_item") or {}
+        if text_item.get("text"):
+            parts.append(str(text_item["text"]))
+            continue
+        voice_item = item.get("voice_item") or {}
+        if voice_item.get("text"):
+            parts.append(str(voice_item["text"]))
+    return "\n".join(parts).strip()
 
 
 async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                        typing_ticket_cache, reconnect_asked, warning_active,
-                       reconnect_in_progress, login_time_ref, cfg):
-    """执行重连流程。防重入，失败时优雅降级，成功后原子替换 token。"""
+                       reconnect_in_progress, login_time_ref, cfg, runtime_state=None):
+    """执行重连流程，并同步保存 2.4.6 token、账号 ID 与游标状态。"""
+    runtime_state = runtime_state if isinstance(runtime_state, dict) else _empty_runtime_state()
     if reconnect_in_progress[0]:
         return
     reconnect_in_progress[0] = True
@@ -275,137 +702,201 @@ async def do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
     reconnect_asked.clear()
 
     print("[重连] 开始重连流程...")
-    from_id = last_contact["from_id"]
-    ctx = last_contact["context_token"]
+    from_id = last_contact.get("from_id")
+    ctx = last_contact.get("context_token")
+    current_token = bot_token_ref[0]
 
-    _base = bot_base_url_ref[0] or BASE_URL
     try:
-        data = await fetch_login_qrcode(session, _base, [bot_token_ref[0]] if bot_token_ref[0] else [])
-        qrcode = data["qrcode"]
-        qrcode_url = data.get("qrcode_img_content", qrcode)
-    except Exception as e:
-        print(f"[重连] 获取二维码失败: {e}")
-        reconnect_in_progress[0] = False
+        async def deliver_qrcode(content):
+            """把当前二维码同时输出到终端并尽力发送给最近联系人。"""
+            qr_msg = f"[重连] 请扫码完成新连接：{content}"
+            print(f"[重连] 请扫码完成新连接：{_redact_text(content)}")
+            # HTTP 图片链接已由 save_qrcode_content 渲染，其他格式在这里补渲染。
+            if not content.startswith("http"):
+                render_terminal_qr(content)
+            await send_msg_safe(session, from_id, ctx, qr_msg, bot_token_ref, bot_base_url_ref)
+
+        try:
+            login_result = await login_with_qrcode(
+                session,
+                [current_token] if current_token else [],
+                existing_state=runtime_state,
+                on_qrcode=deliver_qrcode,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"[重连] 二维码登录失败: {_redact_text(exc)}")
+            await send_msg_safe(
+                session,
+                from_id,
+                ctx,
+                "[失败] 二维码登录未完成，下次到期前会再次提醒",
+                bot_token_ref,
+                bot_base_url_ref,
+            )
+            login_time_ref[0] = time.time()
+            return
+        if login_result.get("already_connected") and current_token:
+            print("[重连] 服务端提示已连接过此 OpenClaw，继续沿用当前连接")
+            new_token = current_token
+            new_base_url = bot_base_url_ref[0] or BASE_URL
+            new_bot_id = runtime_state.get("ilink_bot_id", "")
+            new_user_id = runtime_state.get("ilink_user_id", "")
+        else:
+            new_token = login_result.get("bot_token")
+            new_base_url = login_result.get("baseurl") or bot_base_url_ref[0] or BASE_URL
+            new_bot_id = login_result.get("ilink_bot_id", "")
+            new_user_id = login_result.get("ilink_user_id") or runtime_state.get("ilink_user_id", "")
+
+        if not new_token:
+            reason = "登录状态异常" if login_result.get("login_error") else "扫码超时"
+            print(f"[重连] {reason}，重连未完成")
+            await send_msg_safe(
+                session,
+                from_id,
+                ctx,
+                f"[失败] {reason}，重连未完成，下次到期前会再次提醒",
+                bot_token_ref,
+                bot_base_url_ref,
+            )
+            login_time_ref[0] = time.time()
+            return
+
+        old_bot_id = str(runtime_state.get("ilink_bot_id") or "")
+        account_changed = bool(new_bot_id and old_bot_id != new_bot_id)
+        old_base_url = bot_base_url_ref[0] or BASE_URL
+        credentials_changed = bool(
+            account_changed or new_token != current_token or new_base_url != old_base_url
+        )
+        if account_changed:
+            runtime_state["contexts"] = {}
+            last_contact["from_id"] = None
+            last_contact["context_token"] = None
+
+        if credentials_changed and current_token:
+            await notify_lifecycle(
+                session,
+                "ilink/bot/msg/notifystop",
+                current_token,
+                old_base_url,
+            )
+
+        # 成功：原子替换 token、base_url；同账号保留游标，换账号时隔离状态。
+        bot_token_ref[0] = new_token
+        bot_base_url_ref[0] = new_base_url
+        runtime_state.update({
+            "bot_token": new_token,
+            "baseurl": new_base_url,
+            "ilink_bot_id": new_bot_id,
+            "ilink_user_id": new_user_id,
+            "get_updates_buf": "" if account_changed else runtime_state.get("get_updates_buf", ""),
+            "last_contact": dict(last_contact),
+        })
+        save_runtime_state(runtime_state)
+        if credentials_changed:
+            typing_ticket_cache.clear()
+            await notify_lifecycle(session, "ilink/bot/msg/notifystart", new_token, new_base_url)
+            print("[重连] 新连接已建立，凭据已切换")
+        else:
+            print("[重连] 当前连接仍然有效，无需切换凭据")
+        if not account_changed:
+            completion_text = (
+                "[完成] 新连接已建立，已自动切换，继续使用"
+                if credentials_changed
+                else "[完成] 当前连接仍然有效，可以继续使用"
+            )
+            await send_msg_safe(
+                session,
+                from_id,
+                ctx,
+                completion_text,
+                bot_token_ref,
+                bot_base_url_ref,
+            )
         login_time_ref[0] = time.time()
-        return
-
-    # 发送二维码给用户（失败时控制台打印）
-    qr_msg = f"[重连] 请扫码完成新连接：{qrcode_url}"
-    print(qr_msg)
-    render_terminal_qr(qrcode_url)
-    await send_msg_safe(session, from_id, ctx, qr_msg, bot_token_ref, bot_base_url_ref)
-
-    # 轮询扫码状态（带超时）
-    login_result = await wait_login_confirmation(
-        session,
-        qrcode,
-        _base,
-        timeout_seconds=cfg["qrcode_scan_timeout"],
-        allow_already_connected=True,
-    )
-    if login_result.get("already_connected"):
-        print("[重连] 服务端提示已连接过此 OpenClaw，继续沿用当前连接")
-        new_token = bot_token_ref[0]
-        new_base_url = bot_base_url_ref[0]
-    else:
-        new_token = login_result.get("bot_token")
-        new_base_url = login_result.get("baseurl", bot_base_url_ref[0])
-
-    if new_token is None:
-        # 扫码超时：重置计时，不 crash
-        print("[重连] 扫码超时，重连未完成")
-        await send_msg_safe(session, from_id, ctx,
-                            "[失败] 扫码超时，重连未完成，下次到期前会再次提醒",
-                            bot_token_ref, bot_base_url_ref)
-        login_time_ref[0] = time.time()
+    finally:
         reconnect_in_progress[0] = False
-        return
-
-    # 成功：原子替换 token 和 base_url
-    bot_token_ref[0] = new_token
-    bot_base_url_ref[0] = new_base_url
-    typing_ticket_cache.clear()
-    print("[重连] 新连接已建立，token 已切换")
-    await send_msg_safe(session, from_id, ctx,
-                        "[完成] 新连接已建立，已自动切换，继续使用",
-                        bot_token_ref, bot_base_url_ref)
-
-    reconnect_in_progress[0] = False
-    login_time_ref[0] = time.time()
 
 
 async def reconnect_timer_task(session, bot_token_ref, bot_base_url_ref, last_contact,
                                 typing_ticket_cache, reconnect_asked, warning_active,
-                                reconnect_in_progress, login_time_ref, cfg):
+                                reconnect_in_progress, login_time_ref, cfg, runtime_state=None):
     """独立定时器任务，与主消息循环并发运行。"""
+    runtime_state = runtime_state if isinstance(runtime_state, dict) else _empty_runtime_state()
     while True:
-        # 等待到发警告的时间点
-        elapsed = time.time() - login_time_ref[0]
-        first_wait = max(0, cfg["session_duration"] - cfg["warning_before"] - elapsed)
-        await asyncio.sleep(first_wait)
-
-        # 检查剩余时间（可能因测试值设置而已超过 force_before）
-        remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
-        if remaining <= cfg["force_before"]:
-            force_msg = "[自动] 连接即将到期，开始强制重新连接..."
-            print(force_msg)
-            if not last_contact["from_id"] or not last_contact["context_token"]:
-                print("[自动] 尚无最近联系人，跳过本轮自动重连提醒")
-                login_time_ref[0] = time.time()
-                continue
-            await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                force_msg, bot_token_ref, bot_base_url_ref)
-            await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                               typing_ticket_cache, reconnect_asked, warning_active,
-                               reconnect_in_progress, login_time_ref, cfg)
-            continue
-
-        # 发初次警告
-        remaining_h = remaining / 3600
-        warn_msg = f"[提醒] 连接还剩约 {remaining_h:.1f} 小时到期，是否现在重新连接？回复 Y 立即重连，N 稍后提醒"
-        print(warn_msg)
-        if not last_contact["from_id"] or not last_contact["context_token"]:
-            print("[提醒] 尚无最近联系人，跳过本轮连接到期提醒")
-            login_time_ref[0] = time.time()
-            continue
-        await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                            warn_msg, bot_token_ref, bot_base_url_ref)
-        warning_active[0] = True
-
-        # 询问循环
-        while True:
+        try:
+            elapsed = time.time() - login_time_ref[0]
+            first_wait = max(0, cfg["session_duration"] - cfg["warning_before"] - elapsed)
+            await asyncio.sleep(first_wait)
             remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
+
             if remaining <= cfg["force_before"]:
                 force_msg = "[自动] 连接即将到期，开始强制重新连接..."
                 print(force_msg)
+                if not last_contact.get("from_id") or not last_contact.get("context_token"):
+                    print("[自动] 尚无最近联系人，跳过本轮自动重连提醒")
+                    login_time_ref[0] = time.time()
+                    continue
                 await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
                                     force_msg, bot_token_ref, bot_base_url_ref)
                 await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
                                    typing_ticket_cache, reconnect_asked, warning_active,
-                                   reconnect_in_progress, login_time_ref, cfg)
-                break
+                                   reconnect_in_progress, login_time_ref, cfg, runtime_state)
+                continue
 
-            wait_secs = max(0.0, min(float(cfg["reminder_interval"]),
-                                     remaining - cfg["force_before"]))
-            try:
-                await asyncio.wait_for(reconnect_asked.wait(), timeout=wait_secs)
-                # 用户回 Y，执行重连
-                await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                   typing_ticket_cache, reconnect_asked, warning_active,
-                                   reconnect_in_progress, login_time_ref, cfg)
-                break
-            except asyncio.TimeoutError:
-                # 定时到，重新评估
+            remaining_h = remaining / 3600
+            warn_msg = f"[提醒] 连接还剩约 {remaining_h:.1f} 小时到期，是否现在重新连接？回复 Y 立即重连，N 稍后提醒"
+            print(warn_msg)
+            if not last_contact.get("from_id") or not last_contact.get("context_token"):
+                print("[提醒] 尚无最近联系人，跳过本轮连接到期提醒")
+                login_time_ref[0] = time.time()
+                continue
+            await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
+                                warn_msg, bot_token_ref, bot_base_url_ref)
+            warning_active[0] = True
+
+            while True:
                 remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
                 if remaining <= cfg["force_before"]:
-                    continue  # 下一轮循环走强制重连分支
-                remaining_m = remaining / 60
-                remind_msg = (f"[提醒] 连接还剩约 {remaining_m:.0f} 分钟，"
-                              f"是否现在重新连接？回复 Y 立即重连，N 继续等待")
-                print(remind_msg)
-                # 用最新的 last_contact（可能已更新）
-                await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
-                                    remind_msg, bot_token_ref, bot_base_url_ref)
+                    force_msg = "[自动] 连接即将到期，开始强制重新连接..."
+                    print(force_msg)
+                    await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
+                                        force_msg, bot_token_ref, bot_base_url_ref)
+                    await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
+                                       typing_ticket_cache, reconnect_asked, warning_active,
+                                       reconnect_in_progress, login_time_ref, cfg, runtime_state)
+                    break
+
+                wait_secs = max(0.0, min(float(cfg["reminder_interval"]),
+                                         remaining - cfg["force_before"]))
+                try:
+                    await asyncio.wait_for(reconnect_asked.wait(), timeout=wait_secs)
+                    # 用户回 Y，执行重连
+                    await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
+                                       typing_ticket_cache, reconnect_asked, warning_active,
+                                       reconnect_in_progress, login_time_ref, cfg, runtime_state)
+                    break
+                except asyncio.TimeoutError:
+                    remaining = login_time_ref[0] + cfg["session_duration"] - time.time()
+                    if remaining <= cfg["force_before"]:
+                        continue  # 下一轮循环走强制重连分支
+                    remaining_m = remaining / 60
+                    remind_msg = (f"[提醒] 连接还剩约 {remaining_m:.0f} 分钟，"
+                                  f"是否现在重新连接？回复 Y 立即重连，N 继续等待")
+                    print(remind_msg)
+                    # 用最新的 last_contact（可能已更新）
+                    if last_contact.get("from_id") and last_contact.get("context_token"):
+                        await send_msg_safe(session, last_contact["from_id"], last_contact["context_token"],
+                                            remind_msg, bot_token_ref, bot_base_url_ref)
+        except asyncio.CancelledError:
+            raise
+        except ILinkAPIError as exc:
+            print(f"[自动重连] iLink 请求失败: {_redact_text(exc)}，稍后重新评估")
+            await asyncio.sleep(RETRY_DELAY)
+        except Exception as exc:
+            print(f"[自动重连] 任务异常: {_redact_text(exc)}，稍后重新评估")
+            await asyncio.sleep(RETRY_DELAY)
 
 
 def render_terminal_qr(content: str):
@@ -485,28 +976,73 @@ def save_qrcode_content(content: str):
             render_terminal_qr(content)
 
 
-async def fetch_login_qrcode(session, base_url=BASE_URL, local_token_list=None):
-    body = {"local_token_list": local_token_list or []}
-    data = await api_post(session, "ilink/bot/get_bot_qrcode?bot_type=3", body, None, base_url)
+async def fetch_login_qrcode(session, local_token_list=None, base_url=None):
+    """按 2.4.6 协议申请二维码；local_token_list 最多传 10 个。"""
+    # 兼容旧版调用 fetch_login_qrcode(session, base_url, local_token_list)。
+    # 最新协议始终使用固定二维码入口，旧 base_url 参数不会改变入口。
+    if isinstance(local_token_list, str):
+        legacy_tokens = base_url if isinstance(base_url, (list, tuple)) else []
+        local_token_list = legacy_tokens
+    tokens = []
+    for token in local_token_list or []:
+        token = str(token or "").strip()
+        if token and token not in tokens:
+            tokens.append(token)
+    body = {"local_token_list": tokens[:10]}
+    data = await api_post(
+        session,
+        "ilink/bot/get_bot_qrcode?bot_type=3",
+        body,
+        None,
+        BASE_URL,
+        # 官方 2.1.4 起不再为申请二维码设置固定客户端超时。
+        timeout=None,
+    )
+    ensure_business_success(data, "get_bot_qrcode")
     if data.get("qrcode"):
         return data
+
+    # 只保留旧服务端的 GET 兼容兜底；2.4.6 官方流程为 POST。
     print("POST 获取二维码未返回 qrcode，尝试兼容旧版 GET 流程。")
-    return await api_get(session, "ilink/bot/get_bot_qrcode?bot_type=3", None, base_url)
+    data = await api_get(
+        session,
+        "ilink/bot/get_bot_qrcode?bot_type=3",
+        None,
+        BASE_URL,
+        timeout=None,
+    )
+    ensure_business_success(data, "get_bot_qrcode")
+    return data
 
 
 async def poll_login_status(session, qrcode, base_url=BASE_URL, verify_code=None):
+    """轮询二维码状态。GET 请求不携带 Bearer token，超时视为 wait。"""
     endpoint = f"ilink/bot/get_qrcode_status?qrcode={quote(qrcode, safe='')}"
     if verify_code:
         endpoint += f"&verify_code={quote(verify_code, safe='')}"
-    status = await api_get(session, endpoint, None, base_url)
+    status = await api_get(
+        session,
+        endpoint,
+        None,
+        base_url or BASE_URL,
+        timeout=QR_STATUS_TIMEOUT,
+        long_poll=True,
+    )
+    if status.get("_timeout"):
+        return {"status": "wait"}
+    ensure_business_success(status, "get_qrcode_status")
     state = status.get("status", "")
 
     if state == "confirmed" or status.get("bot_token"):
+        bot_token = status.get("bot_token")
+        ilink_bot_id = status.get("ilink_bot_id")
+        if not bot_token or not ilink_bot_id:
+            return {"login_error": "confirmed 响应缺少 bot_token 或 ilink_bot_id"}
         return {
-            "bot_token": status.get("bot_token"),
-            "baseurl": status.get("baseurl") or status.get("base_url") or base_url,
-            "ilink_bot_id": status.get("ilink_bot_id"),
-            "ilink_user_id": status.get("ilink_user_id"),
+            "bot_token": bot_token,
+            "baseurl": status.get("baseurl") or status.get("base_url") or base_url or BASE_URL,
+            "ilink_bot_id": ilink_bot_id,
+            "ilink_user_id": status.get("ilink_user_id", ""),
         }
     if state == "binded_redirect" or status.get("binded_redirect"):
         return {"already_connected": True}
@@ -515,48 +1051,55 @@ async def poll_login_status(session, qrcode, base_url=BASE_URL, verify_code=None
     if state == "scaned_but_redirect":
         redirect_host = status.get("redirect_host")
         if redirect_host:
-            return {"redirect_base": f"https://{redirect_host}"}
+            redirect_base = str(redirect_host)
+            if not redirect_base.startswith("http"):
+                redirect_base = f"https://{redirect_base}"
+            return {"redirect_base": redirect_base.rstrip("/")}
         print("服务端要求切换扫码轮询节点，但未返回 redirect_host，继续使用当前节点。")
         return {}
     if state == "scaned":
         return {"scanned": True, "verify_code_accepted": bool(verify_code)}
-    elif state in ("need_verifycode", "verify_code_blocked") or status.get("need_verifycode"):
+    if state in ("need_verifycode", "verify_code_blocked") or status.get("need_verifycode"):
         if state == "verify_code_blocked":
             return {"verify_code_blocked": True}
         return {"need_verifycode": True, "retry_verifycode": bool(verify_code)}
-    elif state and state != "wait":
-        print(f"登录状态: {state}，原始响应: {status}")
-
-    if status.get("local_token_list"):
-        print("服务端返回 local_token_list 信息，继续等待扫码确认。")
+    if state and state != "wait":
+        print(f"登录状态: {state}，原始响应: {_redact_text(status)}")
     return {}
 
 
 async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_seconds=None,
                                   allow_already_connected=False):
-    deadline = time.time() + timeout_seconds if timeout_seconds else None
-    current_base_url = base_url
+    timeout_seconds = timeout_seconds or RECONNECT_CONFIG["qrcode_scan_timeout"]
+    deadline = time.time() + timeout_seconds
+    current_base_url = base_url or BASE_URL
     pending_verify_code = None
     scanned_printed = False
 
     while True:
-        if deadline and time.time() >= deadline:
+        if time.time() >= deadline:
             return {"timeout": True}
 
         try:
             result = await poll_login_status(session, qrcode, current_base_url, pending_verify_code)
-        except Exception as e:
-            print(f"轮询扫码状态失败，稍后重试: {e}")
+        except ILinkAPIError as exc:
+            print(f"轮询扫码状态失败({exc.network_type or '业务'}): {_redact_text(exc)}，稍后重试")
+            await asyncio.sleep(1)
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            print(f"轮询扫码状态失败: {_redact_text(exc)}，稍后重试")
             await asyncio.sleep(1)
             continue
 
         if result.get("bot_token"):
             return result
+        if result.get("login_error"):
+            return result
         if result.get("already_connected"):
             return result if allow_already_connected else {"already_connected": True}
-        if result.get("expired"):
-            return result
-        if result.get("verify_code_blocked"):
+        if result.get("expired") or result.get("verify_code_blocked"):
             return result
         if result.get("redirect_base"):
             current_base_url = result["redirect_base"]
@@ -569,191 +1112,313 @@ async def wait_login_confirmation(session, qrcode, base_url=BASE_URL, timeout_se
                 print("已扫码，等待手机端确认...")
                 scanned_printed = True
         if result.get("need_verifycode"):
-            prompt = "你输入的数字不匹配，请重新输入: " if result.get("retry_verifycode") else "请输入手机微信显示的数字配对码: "
-            pending_verify_code = input(prompt).strip()
+            prompt = (
+                "你输入的数字不匹配，请重新输入: "
+                if result.get("retry_verifycode")
+                else "请输入手机微信显示的数字配对码: "
+            )
+            pending_verify_code = (await asyncio.to_thread(input, prompt)).strip()
             continue
 
         await asyncio.sleep(1)
 
 
-async def login_with_qrcode(session, base_url=BASE_URL):
-    refresh_count = 0
-    max_refresh_count = 3
+async def login_with_qrcode(session, local_token_list=None, existing_state=None, on_qrcode=None):
+    """执行官方二维码登录，最多展示 MAX_QR_REFRESH_COUNT 个二维码。"""
+    # 与官方实现一致：初始二维码计为第 1 次，最多共展示 3 个二维码。
+    refresh_count = 1
+    deadline = time.time() + RECONNECT_CONFIG["qrcode_scan_timeout"]
+    existing_state = existing_state or {}
     while True:
-        data = await fetch_login_qrcode(session, base_url)
-        qrcode = data["qrcode"]
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise RuntimeError("登录等待超时，请重新运行后再试。")
+        data = await fetch_login_qrcode(session, local_token_list)
+        qrcode = data.get("qrcode")
+        if not qrcode:
+            raise RuntimeError("二维码响应缺少 qrcode")
         qrcode_img_content = data.get("qrcode_img_content", "")
 
-        print("qrcode:", qrcode)
-        save_qrcode_content(str(qrcode_img_content or qrcode))
+        print("qrcode:", _redact_text(qrcode))
+        qr_content = str(qrcode_img_content or qrcode)
+        try:
+            save_qrcode_content(qr_content)
+        except Exception as exc:
+            print(f"二维码保存失败，将继续使用链接: {_redact_text(exc)}")
+        if on_qrcode:
+            callback_result = on_qrcode(qr_content)
+            if inspect.isawaitable(callback_result):
+                await callback_result
         print("等待扫码...")
 
-        login_result = await wait_login_confirmation(session, qrcode, base_url)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise RuntimeError("登录等待超时，请重新运行后再试。")
+        login_result = await wait_login_confirmation(
+            session,
+            qrcode,
+            BASE_URL,
+            timeout_seconds=remaining,
+            allow_already_connected=True,
+        )
         if login_result.get("bot_token"):
             return login_result
         if login_result.get("already_connected"):
-            print("服务端提示此端已连接过，但当前独立程序没有可复用 token，将重新生成二维码。")
+            old_token = str(existing_state.get("bot_token") or "").strip()
+            if old_token:
+                print("服务端提示已连接过，复用本地保存的 token。")
+                return {
+                    "bot_token": old_token,
+                    "baseurl": existing_state.get("baseurl") or BASE_URL,
+                    "ilink_bot_id": existing_state.get("ilink_bot_id", ""),
+                    "ilink_user_id": existing_state.get("ilink_user_id", ""),
+                    "already_connected": True,
+                }
+            print("服务端提示此端已连接过，但本地没有可复用 token，将重新生成二维码。")
         elif login_result.get("expired"):
             print("二维码已过期，正在重新生成...")
         elif login_result.get("verify_code_blocked"):
             print("多次输入配对码错误，正在刷新二维码...")
+        elif login_result.get("login_error"):
+            raise RuntimeError(login_result["login_error"])
         elif login_result.get("timeout"):
-            print("登录等待超时，正在重新生成二维码...")
+            raise RuntimeError("登录等待超时，请重新运行后再试。")
 
         refresh_count += 1
-        if refresh_count >= max_refresh_count:
+        if refresh_count > MAX_QR_REFRESH_COUNT:
             raise RuntimeError("二维码多次失效或登录失败，请稍后重试。")
 
 
-async def main():
-    async with aiohttp.ClientSession() as session:
-        # 1. 获取二维码并等待扫码
-        login_result = await login_with_qrcode(session)
-        bot_token = login_result["bot_token"]
-        bot_base_url = login_result.get("baseurl", "")
-        print(f"登录成功！baseurl={bot_base_url}")
-        print(f"{'='*40}\n{COMMANDS_MSG}\n{'='*40}")
+async def notify_lifecycle(session, endpoint, token, base_url):
+    """发送 msg/notifystart 或 msg/notifystop 生命周期通知。"""
+    try:
+        result = await api_post(
+            session,
+            endpoint,
+            {"base_info": base_info()},
+            token,
+            base_url or BASE_URL,
+            timeout=CONFIG_TIMEOUT,
+        )
+        ensure_business_success(result, endpoint)
+        print(f"[生命周期] {endpoint} 已通知")
+        return True
+    except ILinkAPIError as exc:
+        print(f"[生命周期] {endpoint} 通知失败: {_redact_text(exc)}")
+        return False
+    except Exception as exc:
+        print(f"[生命周期] {endpoint} 通知异常: {_redact_text(exc)}")
+        return False
 
-        # 3. 共享状态（可变引用，传给定时器任务和消息循环）
+
+async def main():
+    """运行 Python Bot，并实现 2.4.6 的登录、长轮询和优雅停止流程。"""
+    runtime_state = load_runtime_state()
+    saved_token = str(runtime_state.get("bot_token") or "").strip()
+
+    async with aiohttp.ClientSession() as session:
+        if saved_token:
+            # 官方客户端会按账号复用本地凭据；若服务端随后返回 -14，
+            # 消息循环会停止紧密轮询并进入受控二维码重登录。
+            print("[登录] 复用本地保存的微信连接；token 失效时会自动要求重新扫码。")
+            login_result = {
+                "bot_token": saved_token,
+                "baseurl": runtime_state.get("baseurl") or BASE_URL,
+                "ilink_bot_id": runtime_state.get("ilink_bot_id", ""),
+                "ilink_user_id": runtime_state.get("ilink_user_id", ""),
+            }
+        else:
+            login_result = await login_with_qrcode(
+                session,
+                [],
+                existing_state=runtime_state,
+            )
+        bot_token = str(login_result.get("bot_token") or "").strip()
+        if not bot_token:
+            raise RuntimeError("登录响应缺少 bot_token")
+
+        bot_base_url = login_result.get("baseurl") or runtime_state.get("baseurl") or BASE_URL
+        old_account_id = str(runtime_state.get("ilink_bot_id") or "")
+        new_account_id = str(login_result.get("ilink_bot_id") or old_account_id)
+        if new_account_id and old_account_id != new_account_id:
+            # 账号切换时不能复用旧账号的游标和上下文。
+            runtime_state["get_updates_buf"] = ""
+            runtime_state["contexts"] = {}
+            runtime_state["last_contact"] = {"from_id": "", "context_token": ""}
+
+        runtime_state.update({
+            "bot_token": bot_token,
+            "baseurl": bot_base_url,
+            "ilink_bot_id": new_account_id,
+            "ilink_user_id": login_result.get("ilink_user_id") or runtime_state.get("ilink_user_id", ""),
+        })
+        save_runtime_state(runtime_state)
+
+        print(f"登录成功！baseurl={bot_base_url}")
+        print(f"{'=' * 40}\n{COMMANDS_MSG}\n{'=' * 40}")
+
         bot_token_ref = [bot_token]
         bot_base_url_ref = [bot_base_url]
-        last_contact = {"from_id": None, "context_token": None}
+        saved_contact = runtime_state.get("last_contact") or {}
+        last_contact = {
+            "from_id": saved_contact.get("from_id") or None,
+            "context_token": saved_contact.get("context_token") or None,
+        }
         typing_ticket_cache = {}
-        welcomed_users = set()
+        welcomed_users = set(runtime_state.get("contexts", {}).keys())
         reconnect_asked = asyncio.Event()
         warning_active = [False]
         reconnect_in_progress = [False]
         login_time_ref = [time.time()]
-        manual_reconnect_pending = {}  # {from_id: True} 等待用户确认手动重连
+        manual_reconnect_pending = {}
 
-        # 4. 启动定时器任务（与消息循环并发）
-        asyncio.create_task(reconnect_timer_task(
-            session, bot_token_ref, bot_base_url_ref, last_contact,
-            typing_ticket_cache, reconnect_asked, warning_active,
-            reconnect_in_progress, login_time_ref, RECONNECT_CONFIG,
-        ))
+        await notify_lifecycle(session, "ilink/bot/msg/notifystart", bot_token, bot_base_url)
 
-        # 5. 长轮询收消息
-        get_updates_buf = ""
-        print("开始监听消息...")
-        while True:
-            result = await api_post(
-                session,
-                "ilink/bot/getupdates",
-                {"get_updates_buf": get_updates_buf, "base_info": base_info()},
-                bot_token_ref[0],
-                bot_base_url_ref[0] or None,
+        async def apply_new_login(result):
+            """原子替换登录凭据，并在账号变化时隔离游标/上下文。"""
+            new_token = str(result.get("bot_token") or "").strip()
+            if not new_token:
+                raise RuntimeError("重新登录响应缺少 bot_token")
+            old_id = str(runtime_state.get("ilink_bot_id") or "")
+            new_id = str(result.get("ilink_bot_id") or old_id)
+            old_token = str(runtime_state.get("bot_token") or bot_token_ref[0] or "")
+            old_base_url = str(runtime_state.get("baseurl") or bot_base_url_ref[0] or BASE_URL)
+            new_base_url = result.get("baseurl") or old_base_url
+            account_changed = bool(new_id and old_id != new_id)
+            credentials_changed = bool(
+                account_changed or new_token != old_token or new_base_url != old_base_url
             )
-            get_updates_buf = result.get("get_updates_buf") or get_updates_buf
+            if account_changed:
+                runtime_state["get_updates_buf"] = ""
+                runtime_state["contexts"] = {}
+                runtime_state["last_contact"] = {"from_id": "", "context_token": ""}
+                last_contact["from_id"] = None
+                last_contact["context_token"] = None
+                welcomed_users.clear()
+            bot_token_ref[0] = new_token
+            bot_base_url_ref[0] = new_base_url
+            runtime_state.update({
+                "bot_token": new_token,
+                "baseurl": bot_base_url_ref[0],
+                "ilink_bot_id": new_id,
+                "ilink_user_id": result.get("ilink_user_id") or runtime_state.get("ilink_user_id", ""),
+                "get_updates_buf": runtime_state.get("get_updates_buf") or "",
+            })
+            typing_ticket_cache.clear()
+            save_runtime_state(runtime_state)
+            login_time_ref[0] = time.time()
+            if credentials_changed:
+                await notify_lifecycle(
+                    session,
+                    "ilink/bot/msg/notifystart",
+                    bot_token_ref[0],
+                    bot_base_url_ref[0],
+                )
 
-            for msg in result.get("msgs") or []:
-                if msg.get("message_type") != 1:
-                    continue
-                text = msg.get("item_list", [{}])[0].get("text_item", {}).get("text", "")
-                from_id = msg["from_user_id"]
-                context_token = msg["context_token"]
-                print(f"收到消息: {text}")
+        async def handle_message(msg):
+            if not isinstance(msg, dict) or msg.get("message_type") != 1:
+                return
+            from_id = str(msg.get("from_user_id") or "")
+            context_token = str(msg.get("context_token") or "")
+            if not from_id or not context_token:
+                print("[消息] 缺少 from_user_id/context_token，跳过")
+                return
+            text = extract_message_text(msg)
+            print(f"收到消息: {text or '[非文本消息]'}")
 
-                # 更新最近联系人（定时器任务用于发通知）
-                last_contact["from_id"] = from_id
-                last_contact["context_token"] = context_token
+            last_contact.update({"from_id": from_id, "context_token": context_token})
+            runtime_state.setdefault("contexts", {})[from_id] = context_token
+            runtime_state["last_contact"] = dict(last_contact)
+            save_runtime_state(runtime_state)
 
-                # 优先级 1：手动重连 Y/N 确认（/重新连接 发出后等待回复）
-                if manual_reconnect_pending.get(from_id) and text.strip().upper() in ("Y", "N"):
-                    del manual_reconnect_pending[from_id]
-                    if text.strip().upper() == "Y":
-                        await send_msg_safe(session, from_id, context_token,
-                                            "好的，正在重新连接...",
-                                            bot_token_ref, bot_base_url_ref)
-                        await do_reconnect(session, bot_token_ref, bot_base_url_ref, last_contact,
-                                           typing_ticket_cache, reconnect_asked, warning_active,
-                                           reconnect_in_progress, login_time_ref, RECONNECT_CONFIG)
-                    else:
-                        await send_msg_safe(session, from_id, context_token,
-                                            "已取消重新连接",
-                                            bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # 优先级 2：定时预警 Y/N 处理
-                if warning_active[0] and text.strip().upper() in ("Y", "N"):
-                    if text.strip().upper() == "Y":
-                        reconnect_asked.set()
-                        await send_msg_safe(session, from_id, context_token,
-                                            "好的，正在重新连接...",
-                                            bot_token_ref, bot_base_url_ref)
-                    else:
-                        await send_msg_safe(session, from_id, context_token,
-                                            "好的，稍后再提醒您",
-                                            bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # 优先级 3：首次交互，发送指令列表
-                if from_id not in welcomed_users:
-                    welcomed_users.add(from_id)
-                    await send_msg_safe(session, from_id, context_token,
-                                        COMMANDS_MSG, bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # /help  /指令 — 返回指令列表
-                if text.strip() in ("/help", "/指令"):
-                    await send_msg_safe(session, from_id, context_token,
-                                        COMMANDS_MSG, bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # /time 指令
-                if text.strip() == "/time":
-                    _rem = max(0, login_time_ref[0] + RECONNECT_CONFIG["session_duration"] - time.time())
-                    _h, _m, _s = int(_rem // 3600), int((_rem % 3600) // 60), int(_rem % 60)
-                    _ts = f"{_h} 小时 {_m} 分钟" if _h > 0 else f"{_m} 分钟 {_s} 秒"
-                    await send_msg_safe(session, from_id, context_token,
-                                        f"当前连接剩余时间：{_ts}",
+            normalized = text.strip().upper()
+            if manual_reconnect_pending.get(from_id) and normalized in ("Y", "N"):
+                manual_reconnect_pending.pop(from_id, None)
+                if normalized == "Y":
+                    await send_msg_safe(session, from_id, context_token, "好的，正在重新连接...",
                                         bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # /重新连接 — 手动触发重连，等待 Y/N 确认
-                if text.strip() == "/重新连接":
-                    if reconnect_in_progress[0]:
-                        await send_msg_safe(session, from_id, context_token,
-                                            "重连正在进行中，请稍候...",
-                                            bot_token_ref, bot_base_url_ref)
-                    else:
-                        manual_reconnect_pending[from_id] = True
-                        await send_msg_safe(session, from_id, context_token,
-                                            "确认要立即重新连接吗？\n回复 Y 确认重连 / N 取消",
-                                            bot_token_ref, bot_base_url_ref)
-                    continue
-
-                # getconfig 获取 typing_ticket（每个用户缓存一次）
-                if from_id not in typing_ticket_cache:
-                    cfg = await api_post(
-                        session,
-                        "ilink/bot/getconfig",
-                        {"ilink_user_id": from_id, "context_token": context_token,
-                         "base_info": base_info()},
-                        bot_token_ref[0],
-                        bot_base_url_ref[0] or None,
+                    await do_reconnect(
+                        session, bot_token_ref, bot_base_url_ref, last_contact,
+                        typing_ticket_cache, reconnect_asked, warning_active,
+                        reconnect_in_progress, login_time_ref, RECONNECT_CONFIG,
+                        runtime_state,
                     )
-                    typing_ticket_cache[from_id] = cfg.get("typing_ticket", "")
-                typing_ticket = typing_ticket_cache[from_id]
+                else:
+                    await send_msg_safe(session, from_id, context_token, "已取消重新连接",
+                                        bot_token_ref, bot_base_url_ref)
+                return
 
-                # sendtyping status=1 表示"正在输入"
-                if typing_ticket:
-                    await api_post(
-                        session,
-                        "ilink/bot/sendtyping",
-                        {"ilink_user_id": from_id, "typing_ticket": typing_ticket,
-                         "status": 1, "base_info": base_info()},
-                        bot_token_ref[0],
-                        bot_base_url_ref[0] or None,
+            if warning_active[0] and normalized in ("Y", "N"):
+                if normalized == "Y":
+                    reconnect_asked.set()
+                    await send_msg_safe(session, from_id, context_token, "好的，正在重新连接...",
+                                        bot_token_ref, bot_base_url_ref)
+                else:
+                    await send_msg_safe(session, from_id, context_token, "好的，稍后再提醒您",
+                                        bot_token_ref, bot_base_url_ref)
+                return
+
+            if from_id not in welcomed_users:
+                welcomed_users.add(from_id)
+                await send_msg_safe(session, from_id, context_token, COMMANDS_MSG,
+                                    bot_token_ref, bot_base_url_ref)
+                return
+
+            if not text:
+                await send_msg_safe(
+                    session, from_id, context_token,
+                    "当前版本暂支持文字消息（语音转文字消息除外），图片/文件请稍后处理。",
+                    bot_token_ref, bot_base_url_ref,
+                )
+                return
+
+            if text in ("/help", "/指令"):
+                await send_msg_safe(session, from_id, context_token, COMMANDS_MSG,
+                                    bot_token_ref, bot_base_url_ref)
+                return
+            if text == "/time":
+                remaining = max(0, login_time_ref[0] + RECONNECT_CONFIG["session_duration"] - time.time())
+                hours, minutes, seconds = int(remaining // 3600), int((remaining % 3600) // 60), int(remaining % 60)
+                display = f"{hours} 小时 {minutes} 分钟" if hours else f"{minutes} 分钟 {seconds} 秒"
+                await send_msg_safe(session, from_id, context_token, f"当前连接剩余时间：{display}",
+                                    bot_token_ref, bot_base_url_ref)
+                return
+            if text == "/重新连接":
+                if reconnect_in_progress[0]:
+                    await send_msg_safe(session, from_id, context_token, "重连正在进行中，请稍候...",
+                                        bot_token_ref, bot_base_url_ref)
+                else:
+                    manual_reconnect_pending[from_id] = True
+                    await send_msg_safe(
+                        session, from_id, context_token,
+                        "确认要立即重新连接吗？\n回复 Y 确认重连 / N 取消",
+                        bot_token_ref, bot_base_url_ref,
                     )
+                return
 
-                # 调用 AI
-                loop = asyncio.get_event_loop()
-                # 或者替换为你自已要用的接口
-                reply = await loop.run_in_executor(executor, ai.chat, text)
+            typing_ticket = await get_typing_ticket_safe(
+                session,
+                from_id,
+                context_token,
+                typing_ticket_cache,
+                bot_token_ref,
+                bot_base_url_ref,
+            )
 
-                # sendmessage（补全 SDK 所需字段）
-                client_id = f"openclaw-weixin-{random.randint(0, 0xFFFFFFFF):08x}"
+            typing_started = False
+            try:
+                typing_started = await send_typing_safe(
+                    session, from_id, typing_ticket, 1, bot_token_ref, bot_base_url_ref,
+                )
+                try:
+                    loop = asyncio.get_running_loop()
+                    reply = await loop.run_in_executor(executor, ai.chat, text)
+                except Exception as exc:
+                    print(f"[AI] 调用失败: {_redact_text(exc)}")
+                    reply = "抱歉，AI 服务暂时不可用，请稍后再试。"
+                reply = str(reply or "").strip() or "抱歉，我暂时没有生成有效回复。"
+
+                client_id = generate_client_id()
                 send_result = await api_post(
                     session,
                     "ilink/bot/sendmessage",
@@ -771,44 +1436,178 @@ async def main():
                     },
                     bot_token_ref[0],
                     bot_base_url_ref[0] or None,
+                    timeout=API_TIMEOUT,
                 )
-                print(f"sendmessage 返回: {send_result}")
-                print(f"已回复: {reply[:50]}...")
-
-                # sendtyping status=2 取消"正在输入"
-                if typing_ticket:
-                    await api_post(
-                        session,
-                        "ilink/bot/sendtyping",
-                        {"ilink_user_id": from_id, "typing_ticket": typing_ticket,
-                         "status": 2, "base_info": base_info()},
-                        bot_token_ref[0],
-                        bot_base_url_ref[0] or None,
+                ensure_business_success(send_result, "sendmessage")
+                safe_reply = _redact_text(reply)
+                print(f"已回复: {safe_reply[:50]}{'...' if len(safe_reply) > 50 else ''}")
+            finally:
+                if typing_started:
+                    await send_typing_safe(
+                        session, from_id, typing_ticket, 2, bot_token_ref, bot_base_url_ref,
                     )
 
+        async def message_loop():
+            get_updates_buf = str(runtime_state.get("get_updates_buf") or "")
+            long_poll_timeout = LONG_POLL_TIMEOUT
+            consecutive_failures = 0
+            print("开始监听消息...")
+            while True:
+                try:
+                    # 定时/手动重连可能由另一个协程清空持久化游标。
+                    # 每轮先同步一次，避免新连接继续使用旧账号的游标。
+                    state_cursor = str(runtime_state.get("get_updates_buf") or "")
+                    if state_cursor != get_updates_buf:
+                        get_updates_buf = state_cursor
+                        long_poll_timeout = LONG_POLL_TIMEOUT
 
-print(
-    "\n"
-    "╔══════════════════════════════════════════════════════════╗\n"
-    "║          微信 ClawBot  ·  WeChat iLink Bot               ║\n"
-    "║  Copyright (c) 2026 SiverKing. All rights reserved.     ║\n"
-    "║  GitHub : https://github.com/SiverKing/weixin-ClawBot-API║\n"
-    "╚══════════════════════════════════════════════════════════╝"
-)
+                    request_token = bot_token_ref[0]
+                    request_base_url = bot_base_url_ref[0] or BASE_URL
+                    result = await api_post(
+                        session,
+                        "ilink/bot/getupdates",
+                        {"get_updates_buf": get_updates_buf, "base_info": base_info()},
+                        request_token,
+                        request_base_url,
+                        timeout=long_poll_timeout,
+                        long_poll=True,
+                        fallback_cursor=get_updates_buf,
+                    )
+                    if result.get("_timeout"):
+                        await asyncio.sleep(0)
+                        continue
+                    if (
+                        request_token != bot_token_ref[0]
+                        or request_base_url != (bot_base_url_ref[0] or BASE_URL)
+                    ):
+                        # 重连期间完成的旧长轮询响应不能覆盖新连接的状态。
+                        get_updates_buf = str(runtime_state.get("get_updates_buf") or "")
+                        long_poll_timeout = LONG_POLL_TIMEOUT
+                        continue
+                    ensure_business_success(result, "getupdates")
+                    consecutive_failures = 0
 
-_raw_cfg = load_or_create_config()
-if _raw_cfg["provider"] == "deepseek":
-    ai = DeepSeekAPI(DeepSeekConfig(
-        api_key=_raw_cfg["api_key"],
-        base_url=_raw_cfg["base_url"],
-        model=_raw_cfg["model"],
-        prompt=_raw_cfg["prompt"],
+                    new_cursor = result.get("get_updates_buf")
+                    if isinstance(new_cursor, str) and new_cursor:
+                        get_updates_buf = new_cursor
+                        runtime_state["get_updates_buf"] = new_cursor
+                        save_runtime_state(runtime_state)
+
+                    suggested_ms = result.get("longpolling_timeout_ms")
+                    try:
+                        if suggested_ms is not None and float(suggested_ms) > 0:
+                            long_poll_timeout = max(
+                                1.0,
+                                min(MAX_LONG_POLL_TIMEOUT, float(suggested_ms) / 1000.0),
+                            )
+                    except (TypeError, ValueError):
+                        pass
+
+                    for msg in result.get("msgs") or []:
+                        await handle_message(msg)
+                except asyncio.CancelledError:
+                    raise
+                except ILinkAPIError as exc:
+                    if exc.is_stale_token:
+                        print("[iLink] ret/errcode=-14，当前 token 已失效，进入受控重新登录。")
+                        runtime_state["bot_token"] = ""
+                        save_runtime_state(runtime_state)
+                        try:
+                            await asyncio.sleep(RETRY_DELAY)
+                            fresh_login = await login_with_qrcode(session, [], existing_state={})
+                            await apply_new_login(fresh_login)
+                            # 同账号重新登录沿用该账号游标；切换账号时
+                            # apply_new_login 会清空持久化状态，这里同步本地变量。
+                            get_updates_buf = str(runtime_state.get("get_updates_buf") or "")
+                            long_poll_timeout = LONG_POLL_TIMEOUT
+                            consecutive_failures = 0
+                            continue
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as relogin_exc:
+                            print(f"[iLink] 重新登录失败: {_redact_text(relogin_exc)}")
+                            consecutive_failures += 1
+                            await asyncio.sleep(BACKOFF_DELAY)
+                            continue
+                    consecutive_failures += 1
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        delay = BACKOFF_DELAY
+                        consecutive_failures = 0
+                    else:
+                        delay = RETRY_DELAY
+                    print(f"[iLink] getupdates 失败({exc.network_type or '业务'}): {_redact_text(exc)}；{delay}s 后重试")
+                    await asyncio.sleep(delay)
+                except Exception as exc:
+                    consecutive_failures += 1
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        delay = BACKOFF_DELAY
+                        consecutive_failures = 0
+                    else:
+                        delay = RETRY_DELAY
+                    print(f"[消息循环] 未分类异常: {_redact_text(exc)}；{delay}s 后重试")
+                    await asyncio.sleep(delay)
+
+        timer_task = asyncio.create_task(reconnect_timer_task(
+            session, bot_token_ref, bot_base_url_ref, last_contact,
+            typing_ticket_cache, reconnect_asked, warning_active,
+            reconnect_in_progress, login_time_ref, RECONNECT_CONFIG, runtime_state,
+        ))
+        message_task = asyncio.create_task(message_loop())
+        try:
+            await message_task
+        finally:
+            for task in (message_task, timer_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(message_task, timer_task, return_exceptions=True)
+            if bot_token_ref[0]:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(notify_lifecycle(
+                            session,
+                            "ilink/bot/msg/notifystop",
+                            bot_token_ref[0],
+                            bot_base_url_ref[0] or BASE_URL,
+                        )),
+                        timeout=CONFIG_TIMEOUT + 1,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError as exc:
+                    print(f"[生命周期] 停止通知超时: {_redact_text(exc)}")
+                except Exception as exc:
+                    print(f"[生命周期] 停止通知未完成: {_redact_text(exc)}")
+
+
+def create_ai_client(raw_cfg: dict):
+    """根据配置创建 AI 客户端，保持启动入口与协议代码解耦。"""
+    if raw_cfg["provider"] == "deepseek":
+        return DeepSeekAPI(DeepSeekConfig(
+            api_key=raw_cfg["api_key"],
+            base_url=raw_cfg["base_url"],
+            model=raw_cfg["model"],
+            prompt=raw_cfg["prompt"],
+        ))
+    return DusAPI(DusConfig(
+        api_key=raw_cfg["api_key"],
+        base_url=raw_cfg["base_url"],
+        model1=raw_cfg["model"],
+        prompt=raw_cfg["prompt"],
     ))
-else:
-    ai = DusAPI(DusConfig(
-        api_key=_raw_cfg["api_key"],
-        base_url=_raw_cfg["base_url"],
-        model1=_raw_cfg["model"],
-        prompt=_raw_cfg["prompt"],
-    ))
-asyncio.run(main())
+
+
+if __name__ == "__main__":
+    print(
+        "\n"
+        "╔══════════════════════════════════════════════════════════╗\n"
+        "║          微信 ClawBot  ·  WeChat iLink Bot               ║\n"
+        "║  Copyright (c) 2026 SiverKing. All rights reserved.     ║\n"
+        "║  GitHub : https://github.com/SiverKing/weixin-ClawBot-API║\n"
+        "╚══════════════════════════════════════════════════════════╝"
+    )
+    _raw_cfg = load_or_create_config()
+    ai = create_ai_client(_raw_cfg)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n已停止 Bot。")

@@ -1,96 +1,62 @@
-# 微信 Claw Bot(@tencent-weixin/openclaw-weixin)
+# 微信 Claw Bot（Python）
 
-基于腾讯官方开放的 **openclaw-weixin**/**openclaw-weixin-api**/**openclaw-weixin-cli** 实现的微信个人账号 Bot，支持接入任意 AI 模型，实现微信自动对话。
+这是一个直接调用腾讯微信 iLink Bot 接口的 Python 客户端示例。它无需部署 OpenClaw，即可通过扫码登录微信个人账号，并把收到的文字消息交给 DusAPI 或 DeepSeek 生成回复。
 
----
+当前运行代码按腾讯微信 iLink Bot 2.4.6 的公开 HTTP 行为对齐。协议细节和版本差异记录在 [weixin-openclaw-api-py-docs.md](weixin-openclaw-api-py-docs.md)。
 
-## 简介
+## 更强大的选择：Siver WX机器人（wxbot_plus）
 
-2026 年腾讯通过 [OpenClaw](https://docs.openclaw.ai) 平台正式开放了微信个人账号的 Bot API，官方名称为 **微信 ClawBot 插件功能**，底层协议为 **iLink**，接入域名 `ilinkai.weixin.qq.com` 为腾讯官方服务器。
+如果你需要更强大的微信自动化能力，推荐作者的另一款项目 —— [**Siver WX机器人（SiverWXbot_plus）**](https://github.com/SiverKing/SiverWXbot_plus)：
 
-本项目提供 Python 和 Node.js 两种实现，可直接接入 DusAPI、DeepSeek 等 AI 接口，实现收到微信消息后自动 AI 回复。**免 openclaw 部署和登录，直接接入与调用。**
+- **内置 AI 面板管家（Agent）**：支持自然语言对话完成面板配置、Prompt 编写、运行状态检查、故障排查，甚至源码版定制开发
+- **已打通本项目的 ClawBot 连接**：内置 agent 可直接接入微信 ClawBot，用手机微信远程管理机器人，电脑端离线也能用
+- **功能完整**：多 AI 平台接入、多 Prompt 管理、对话记忆、图片识别、关键词回复、自定义规则转发、定时任务、朋友圈自动化、Web 管理面板等 50+ 管理命令
 
----
+详细介绍见：[AI 面板管家与 ClawBot 连接说明](https://wxbot.siverking.online/docs.html?c=ai%E9%9D%A2%E6%9D%BF%E7%AE%A1%E7%90%86)
 
 ## 功能
 
-- 扫码登录微信（支持终端二维码渲染，缺少依赖时回退二维码链接）
-- 长轮询实时接收消息
-- 调用 AI 接口生成回复（Python 版支持 DusAPI / DeepSeek provider 选择）
-- 发送前显示"正在输入"状态
-- 内置梯度重试（AI 接口失败自动重试）
-- **配置文件管理**：单个 `config.json` 分 provider 存放配置，启动时选择 AI 提供商，API Key 脱敏显示
-- **24 小时自动重连**：到期前预警 → 用户确认 → 无缝切换新连接，全程不断线
-- **Bot 指令系统**：`/help` `/指令` 查看指令列表，`/time` 查询剩余连接时间，`/重新连接` 手动触发重连，首次交互自动推送指令列表
-
----
+- 固定入口申请二维码，支持扫码状态长轮询、数字配对码和节点跳转
+- `getupdates` 长轮询收消息，并持久化 `get_updates_buf` 游标
+- `getconfig`、输入状态和完整文本 `sendmessage` 流程
+- 校验 HTTP、JSON、`ret/errcode`，识别 `-14` 失效 token 并受控重新登录
+- 启动/停止时最佳努力调用 `notifystart` / `notifystop`
+- 连接到期前提醒、确认和自动重连
+- DusAPI / DeepSeek provider 配置与 API Key 脱敏显示
+- 终端二维码渲染；缺少图像依赖时保留二维码链接
 
 ## 文件结构
 
-```
+```text
 .
-├── bot.py         # Python 实现（推荐）
-├── bot.js         # Node.js 实现
-├── dusapi.py      # AI 接口封装（Python，兼容 Anthropic 格式）
-├── deepseek.py    # DeepSeek 接口封装（Python，OpenAI-compatible）
-├── requirements.txt
-├── config.json    # 配置文件（首次运行自动生成，勿提交到版本控制）
+├── bot.py              # Bot 主程序
+├── dusapi.py           # DusAPI 兼容封装
+├── deepseek.py         # DeepSeek 兼容封装
+├── requirements.txt    # Python 依赖
+├── config.json         # 首次运行自动生成，请勿提交
+├── weixin_state.json   # 首次登录自动生成，包含敏感连接状态，请勿提交
 └── README.md
 ```
 
----
-
 ## 快速开始
 
-> **懒得折腾？** 直接下载打包好的 exe 使用：[Releases](https://github.com/SiverKing/weixin-ClawBot-API/releases)
-
-### Python 版
-
-**安装依赖：**
 ```bash
 pip install -r requirements.txt
-```
-
-**运行：**
-```bash
 python bot.py
 ```
 
-首次运行会先选择 AI 提供商，再引导填写该提供商的 API Key、接口地址、模型和系统提示词。
+首次运行会选择 AI provider，并填写 API Key、接口地址、模型和系统提示词。也可以从 [Releases](https://github.com/SiverKing/weixin-ClawBot-API/releases) 下载打包版本。登录成功后会按账号保存连接状态，正常重启直接复用；服务端返回 `-14` 或手动执行重连时进入受控重新扫码。
 
----
+首次登录或 token 失效后的登录步骤：
 
-### Node.js 版
+1. 选择并确认 AI 配置。
+2. 使用手机微信扫描终端显示的二维码。
+3. 如果手机要求数字配对码，在终端输入配对码。
+4. 登录成功后，在微信中发送消息；首次交互会收到指令列表。
 
-**要求：** Node.js 18+
+## 配置文件
 
-**配置 `package.json`（如不存在则创建）：**
-```json
-{ "type": "module" }
-```
-
-**运行：**
-```bash
-node bot.js
-```
-
----
-
-### 登录流程
-
-1. 运行后先选择 AI 提供商，并确认或创建对应配置
-2. 配置完成后终端打印扫码地址，并在安装 `qrcode[pil]` / `Pillow` 时直接渲染二维码
-3. 手机微信扫码或打开链接，按提示连接
-4. 如微信要求数字配对码，按终端提示输入手机端显示的数字
-5. 扫码确认后终端显示"登录成功"及可用指令列表
-6. 在微信中向 Bot 发送第一条消息，Bot 自动回复指令列表
-7. 之后的消息均由 AI 自动回复
-
----
-
-## 配置文件（config.json）
-
-首次运行自动生成，所有 AI provider 配置都存放在同一个文件里，通过 `provider` 指定当前启用项。旧版扁平配置会自动迁移到 `providers.dusapi`。
+`config.json` 支持多个 provider，旧版扁平配置会自动迁移：
 
 ```json
 {
@@ -112,204 +78,109 @@ node bot.js
 }
 ```
 
-再次运行时会先选择提供商，再显示该提供商配置（API Key 仅显示首尾各 5 位），选择继续、重新配置或切换提供商：
+启动时 API Key 只显示首尾各 5 位。`config.json` 和运行状态文件含有敏感凭据，请妥善保管。
 
-```
-请选择 AI 提供商：
-  1. DusAPI
-  2. DeepSeek （默认）
-
-============================================================
-  当前选择：DeepSeek
-  当前配置如下：
-============================================================
-  API Key  : sk-d0*****************************e8c5c
-  API 地址 : https://api.deepseek.com
-  模型     : deepseek-v4-flash
-  提示词   : 你是一个有帮助的AI助手，请用中文简洁地回复。字数尽量...
-------------------------------------------------------------
-
-使用此配置继续？(直接回车或输入 Y 继续 / 输入 N 重新配置 / 输入 S 切换提供商):
-```
-
-### AI provider
-
-| Provider | 文件 | 接口格式 | 默认地址 | 默认模型 |
-|---|---|---|---|---|
-| DusAPI | `dusapi.py` | Anthropic `/v1/messages` | `https://api.dusapi.com` | `gpt-5` |
-| DeepSeek | `deepseek.py` | OpenAI-compatible `/chat/completions` | `https://api.deepseek.com` | `deepseek-v4-flash` |
-
-DeepSeek 调用使用 `Authorization: Bearer <api_key>`，普通聊天默认关闭 `deepseek-v4-flash` 的 thinking。
-
----
-
-## 24 小时自动重连
-
-iLink 连接有效期为 24 小时，Bot 内置全自动续连机制。
-
-### 流程
-
-```
-登录成功 → 开始 24h 倒计时
-  ↓（剩余 2h 时）
-向最近聊天用户发送预警：是否现在重新连接？(Y/N)
-  ├─ 回复 Y → 立即重连，发送新二维码
-  ├─ 回复 N → 每 30 分钟再次询问
-  └─ 最后 30 分钟 → 强制重连，无需确认
-扫码成功 → 新 token 原子替换，旧连接无缝切换，不掉线
-```
-
-### 可调参数（顶部 `RECONNECT_CONFIG`）
-
-测试时可将数值改小，无需等 24 小时验证流程：
-
-| 参数 | 说明 | 生产默认值 | 测试建议值 |
+| Provider | 配置文件 | 默认地址 | 默认模型 |
 |---|---|---|---|
-| `session_duration` | 会话总时长（秒） | `24 * 3600` | `300` |
-| `warning_before` | 提前多久发警告（秒） | `2 * 3600` | `60` |
-| `reminder_interval` | 回复 N 后多久再问（秒） | `30 * 60` | `30` |
-| `force_before` | 最后多久强制重连（秒） | `30 * 60` | `60` |
-| `qrcode_scan_timeout` | 等待扫码最长时间（秒） | `600` | `120` |
-
-**Python 示例（测试配置）：**
-```python
-RECONNECT_CONFIG = {
-    "session_duration":    300,
-    "warning_before":       60,
-    "reminder_interval":    30,
-    "force_before":         60,
-    "qrcode_scan_timeout": 120,
-}
-```
-
----
+| DusAPI | `dusapi.py` | `https://api.dusapi.com` | `gpt-5` |
+| DeepSeek | `deepseek.py` | `https://api.deepseek.com` | `deepseek-v4-flash` |
 
 ## Bot 指令
 
 | 指令 | 说明 |
 |---|---|
-| `/help` 或 `/指令` | 查看全部指令列表 |
+| `/help` 或 `/指令` | 查看指令列表 |
 | `/time` | 查询当前连接剩余时间 |
-| `/重新连接` | 手动触发重新连接（发送后需回复 Y 确认 / N 取消） |
+| `/重新连接` | 请求立即重连，随后回复 `Y` 或 `N` |
 
-**说明：**
-- 用户首次发送消息时，Bot 自动回复可用指令列表
-- `/重新连接` 发出后 Bot 会询问确认，回复 Y 立即重连并发送新二维码，回复 N 取消；若重连正在进行中则提示等待
-- 非指令内容均转发给 AI 接口处理
-- 后续如需扩展指令，在消息循环中添加对应分支，并更新 `COMMANDS_MSG` 常量即可
+非指令文字会转发给 AI。图片、文件和未提供文字转写的语音目前只会收到能力提示，不会被错误地送入 AI。
 
----
+## 自动重连
 
-## AI 接口说明（dusapi.py）
+`bot.py` 顶部的 `RECONNECT_CONFIG` 可调整项目侧的提醒策略：
 
-`DusAPI` 封装了兼容 Anthropic 格式的 HTTP 接口，支持所有使用 `x-api-key` + `/v1/messages` 格式的服务，包括：
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `session_duration` | `24 * 3600` | 项目侧连接计时窗口（秒） |
+| `warning_before` | `2 * 3600` | 提前提醒时间（秒） |
+| `reminder_interval` | `30 * 60` | 用户回复 N 后再次提醒间隔（秒） |
+| `force_before` | `30 * 60` | 剩余时间低于此值时强制重连（秒） |
+| `qrcode_scan_timeout` | `480` | 整体扫码等待上限（秒） |
 
-- [DusAPI](https://dusapi.com)（兼容多模型）
-- Anthropic 官方 API
-- 其他 Anthropic 格式的第三方代理
+这些是客户端调度参数，不是服务端承诺的固定 token 生命周期。服务端明确返回 `ret=-14` 或 `errcode=-14` 时，程序会停止紧密轮询并重新走二维码登录。
 
-**DusConfig 参数：**
+## iLink 2.4.6 协议要点
 
-| 参数 | 说明 | 默认值 |
-|---|---|---|
-| `api_key` | API 密钥 | 必填 |
-| `base_url` | 接口地址 | 必填 |
-| `model1` | 模型名称 | `claude-sonnet-4-5` |
-| `prompt` | 系统提示词 | `你是一个有帮助的AI助手。` |
+### 请求头与基础信息
 
----
+登录后的 POST 请求使用以下头部；`Content-Length` 由 `aiohttp` 自动计算，不手动设置：
 
-## iLink Bot API 核心说明
-
-### 请求头
-
-每个请求都需要携带以下 Header：
-
-```
+```text
 Content-Type: application/json
 AuthorizationType: ilink_bot_token
-X-WECHAT-UIN: <随机uint32转base64，每次请求重新生成>
+X-WECHAT-UIN: <随机 uint32 的十进制字符串再 base64>
 iLink-App-Id: bot
-iLink-App-ClientVersion: <2.x 客户端版本号>
+iLink-App-ClientVersion: 132102
 Authorization: Bearer <bot_token>
 ```
 
-Python 版当前按 openclaw-weixin 2.x 风格补充 `base_info`：
+每个 CGI 请求体都带有：
 
 ```json
 {
-  "channel_version": "2.4.3",
-  "bot_agent": "weixin-ClawBot-API/1.0.1 (python)"
-}
-```
-
-### 消息收发流程
-
-```
-POST getupdates（长轮询，服务器 hold 35s）
-  └─ 收到用户消息
-       ├─ [手动重连待确认] Y → 立即重连 / N → 取消
-       ├─ [定时预警待确认] Y → 触发重连 / N → 推迟提醒
-       ├─ [首次] 发送指令列表，等待下一条消息
-       ├─ [/help 或 /指令] 返回指令列表
-       ├─ [/time] 返回剩余时间
-       ├─ [/重新连接] 发送 Y/N 确认提示
-       ├─ POST getconfig  → 获取 typing_ticket（每用户缓存，有效24h）
-       ├─ POST sendtyping { status: 1 }  → 显示"正在输入"
-       ├─ 调用 AI 接口
-       ├─ POST sendmessage  → 发送回复
-       └─ POST sendtyping { status: 2 }  → 取消"正在输入"
-```
-
-### sendmessage 必填字段
-
-官方 SDK 要求 `sendmessage` 包含以下完整结构，缺少任意字段会导致消息静默丢失（HTTP 200 但不投递）：
-
-```json
-{
-  "msg": {
-    "from_user_id": "",
-    "to_user_id": "<用户ID@im.wechat>",
-    "client_id": "openclaw-weixin-<随机hex>",
-    "message_type": 2,
-    "message_state": 2,
-    "context_token": "<从收到的消息中原样取>",
-    "item_list": [
-      { "type": 1, "text_item": { "text": "回复内容" } }
-    ]
-  },
   "base_info": {
-    "channel_version": "2.4.3",
-    "bot_agent": "weixin-ClawBot-API/1.0.1 (python)"
+    "channel_version": "2.4.6",
+    "bot_agent": "weixin-ClawBot-API/1.2.0 (python)"
   }
 }
 ```
 
-> **注意**：`context_token` 必须使用当前收到消息中的值，不可复用旧消息的 token。
+二维码状态 GET 请求只发送公共应用头；首次申请二维码固定使用 `https://ilinkai.weixin.qq.com`。扫码状态遇到 `scaned_but_redirect` 后，才切换到服务端返回的节点。
 
----
+### 登录流程
+
+```text
+POST /ilink/bot/get_bot_qrcode?bot_type=3
+  body: { "local_token_list": [最多 10 个本地 token] }
+GET  /ilink/bot/get_qrcode_status?qrcode=...
+  → wait / scaned / need_verifycode / scaned_but_redirect
+  → binded_redirect（本地仍有 token 时复用）
+  → confirmed（保存 bot_token、baseurl、账号 ID）
+POST /ilink/bot/msg/notifystart
+```
+
+### 消息流程
+
+```text
+POST getupdates（携带上次成功的 get_updates_buf）
+  → 校验 ret/errcode，保存新游标
+  → 按 longpolling_timeout_ms 调整下一次长轮询
+POST getconfig
+POST sendtyping { status: 1 }
+调用 AI
+POST sendmessage（校验 ret）
+POST sendtyping { status: 2 }（finally 中尽力执行）
+```
+
+`sendmessage.msg.context_token` 必须使用当前入站消息的 token；`client_id` 每次发送都唯一。HTTP 200 不代表消息投递成功，必须同时检查 JSON 和业务返回码。
+
+程序停止时会先取消长轮询和重连任务，再以独立短超时调用 `POST /ilink/bot/msg/notifystop`。
 
 ## 注意事项
 
-1. **每次扫码登录 Bot ID 会变化**，这是 iLink 平台的设计，属于正常现象。
-2. **仅限合规使用**，需遵守《微信 ClawBot 功能使用条款》，腾讯保留对内容过滤和限速的权利。
-3. 本项目仅支持**文本消息**，图片/语音/文件等媒体消息需额外实现 CDN 加密上传流程。
-4. Bot 不建议用于核心业务，腾讯可随时变更或终止该服务。
-5. `config.json` 含有 API Key，**请勿提交到版本控制**（已在 `.gitignore` 中排除）。
-
----
+1. 本项目当前以文字私聊为主；媒体消息需要额外实现 AES-128-ECB 加密和 CDN 上传/下载。
+2. 不要把 `config.json`、`weixin_state.json`、二维码或 token 提交到版本控制。
+3. 微信服务端可能限速、过滤内容或调整接口，生产环境请增加监控和人工重登预案。
+4. 请遵守微信 ClawBot 功能条款及当地法律法规。
 
 ## 依赖
 
-| 环境 | 依赖 |
-|---|---|
-| Python | 见 `requirements.txt`：`aiohttp`、`requests`、`qrcode[pil]`、`pyinstaller`（打包用） |
-| Node.js | 无需额外安装（Node.js 18+ 内置 fetch 和 readline） |
+详见 `requirements.txt`：`aiohttp`、`requests`、`qrcode[pil]`；打包可选 `pyinstaller`。
 
----
+## 致谢
 
-## 相关资源
+本项目参考并借鉴了以下项目，在此表示衷心感谢：
 
-- [OpenClaw 官方文档](https://docs.openclaw.ai)
-- [官方 npm 包](https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin)
-- [DusAPI（兼容多模型的 AI 接口）](https://dusapi.com)
+- 感谢 [OpenClaw](https://github.com/openclaw/openclaw) 项目及其[官方文档](https://docs.openclaw.ai)，本项目最初基于其架构思路开发
+- 感谢 [DeepSeek](https://www.deepseek.com) 提供的 API 服务
+- 感谢 [腾讯微信openclaw-weixin](https://github.com/Tencent/openclaw-weixin) 提供的接口能力
